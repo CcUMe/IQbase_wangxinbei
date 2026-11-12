@@ -1,0 +1,14 @@
+{
+  "run": {
+    "data": "artifacts/data_full",
+    "checkpoint": "logs/finetune_v1",
+    "output": "artifacts/structure_research/evaluation_fp32.json"
+  },
+  "runtime": {
+    "device": "auto",
+    "gpus": "2",
+    "batch_size": 256,
+    "precision": "fp32",
+    "max_batches": 0
+  }
+}

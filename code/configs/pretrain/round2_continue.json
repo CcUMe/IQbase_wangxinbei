@@ -1,0 +1,167 @@
+{
+  "schema_version": 2,
+  "experiment": {
+    "name": "structure_round2_continue",
+    "description": "第二轮结构预训练：沿用第一轮共享基座，使用教师特征词表；重新初始化结构头和优化器。"
+  },
+  "run": {
+    "data": "artifacts/data_full",
+    "output": "logs/pretrain_v2",
+    "codebook": "artifacts/structure_research_01/codebook_v2",
+    "init_checkpoint": "logs/pretrain_v1/20261111_234233_793915/best.pt",
+    "warmstart_checkpoint": ""
+  },
+  "model": {
+    "encoder": {
+      "width": 768,
+      "depth": 12,
+      "heads": 6,
+      "mlp_ratio": 4.0,
+      "dropout": 0.1,
+      "attention_dropout": 0.1,
+      "rope_base": 10000.0,
+      "qk_normalization": true,
+      "qk_scale": 1.0
+    },
+    "signal": {
+      "patch_size": 16,
+      "stft_window": 64,
+      "phase_features": true,
+      "global_spectrum": true,
+      "spectral_backend": "fft",
+      "position": "samples",
+      "position_options": {
+        "reference_length": 1024,
+        "window_head_fraction": 0.5,
+        "absolute_features": true,
+        "sample_rate_hz": 0.0,
+        "reference_sample_rate_hz": 1.0
+      },
+      "rms_epsilon": 1e-06,
+      "normalize_fusion": false
+    },
+    "heads": {
+      "parameter_mode": "regression",
+      "classification_hidden_ratio": 0.5,
+      "grid_residual_scale": 0.1,
+      "parameter_query_temperature": 1.0
+    }
+  },
+  "data": {
+    "batch_size": 256,
+    "steps_per_epoch": 0,
+    "merge_paired": false,
+    "sampling": {
+      "mode": "balanced",
+      "task_probabilities": {
+        "modulation": 1.0,
+        "protocol": 1.0,
+        "parameter": 1.0
+      }
+    },
+    "loader": {
+      "num_workers": 4,
+      "pin_memory": true,
+      "persistent_workers": false,
+      "prefetch_factor": 2
+    }
+  },
+  "training": {
+    "stage": "pretrain",
+    "epochs": 80,
+    "max_steps": 0,
+    "gradient_accumulation_steps": 1,
+    "gradient_clip": 1.0
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0003,
+    "backbone_lr_factor": 1.0,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "exclude_bias_and_norm_from_decay": false,
+    "skip_inactive_heads": true
+  },
+  "scheduler": {
+    "name": "cosine",
+    "warmup_steps": 2000,
+    "warmup_ratio": 0.0,
+    "warmup_start_factor": 0.0,
+    "min_lr_ratio": 0.01
+  },
+  "loss": {
+    "supervised": {
+      "task_weights": {
+        "modulation": 1.0,
+        "protocol": 1.0,
+        "parameter": 1.0
+      },
+      "label_smoothing": 0.0,
+      "regression": "mse",
+      "huber_delta": 1.0,
+      "parameter_weights": {
+        "symbol_rate": 1.0,
+        "bandwidth": 1.0,
+        "frequency_shift": 1.0,
+        "pulse_width": 1.0,
+        "pri": 1.0,
+        "time_delay": 1.0,
+        "number_of_pulses": 1.0
+      },
+      "grid_weight": 0.1
+    },
+    "pretraining": {
+      "mask": {
+        "ratio": 0.3,
+        "span": 2,
+        "strategy": "random",
+        "energy_fraction": 0.5,
+        "energy_floor": 0.05
+      },
+      "weights": {
+        "reconstruction": 0,
+        "atomic": 1.0,
+        "emergent": 1.0,
+        "spectrum": 0
+      },
+      "equalize_emergent_spans": false
+    }
+  },
+  "evaluation": {
+    "every_epochs": 1,
+    "batch_size": 256,
+    "max_batches": 0,
+    "precision": "fp32",
+    "mask_seed": 12345,
+    "selection_metric": "auto",
+    "proxy_task_weights": {
+      "modulation": 30.0,
+      "protocol": 30.0,
+      "parameter": 40.0
+    }
+  },
+  "checkpoint": {
+    "resume_from": "",
+    "save_last": true,
+    "save_best": true,
+    "save_every_steps": 0,
+    "save_every_epochs": 0
+  },
+  "runtime": {
+    "device": "auto",
+    "gpus": "1",
+    "processes": 1,
+    "precision": "bf16",
+    "seed": 2026,
+    "threads": 4,
+    "log_every": 50,
+    "deterministic": false,
+    "allow_tf32": false,
+    "progress_bar": true,
+    "progress_min_interval": 0.5
+  }
+}

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+artifacts/
+weights/*.safetensors
+weights/*.pt
+logs/
+core
+core.*
+合肥讲座/
+.vscode/

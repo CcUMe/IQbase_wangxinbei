@@ -1,0 +1,25 @@
+{
+  "run": {
+    "data": "artifacts/data_full",
+    "output": "artifacts/structure_research_01/codebook_v1",
+    "teacher_checkpoint": ""
+  },
+  "atomic": {
+    "vocab_size": 512,
+    "max_patches": 200000,
+    "iterations": 20,
+    "chunk_size": 4096
+  },
+  "emergent": {
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000
+  },
+  "runtime": {
+    "batch_size": 128,
+    "seed": 2026,
+    "device": "auto",
+    "threads": 4,
+    "gpus": "2"
+  }
+}

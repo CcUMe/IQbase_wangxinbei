@@ -1,0 +1,21 @@
+{
+  "run": {
+    "input": "/mnt/disk1/wangxinbei_contest_dataset/C01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet",
+    "output": "artifacts/structure_research/predictions.jsonl",
+    "weights": "artifacts/structure_research/weights_v1",
+    "log": "logs/inference.json"
+  },
+  "runtime": {
+    "device": "auto",
+    "precision": "fp32",
+    "threads": 4,
+    "gpus": "2",
+    "processes": 1
+  },
+  "batching": {
+    "batch_size": 128
+  },
+  "spectrum": {
+    "backend": null
+  }
+}

@@ -1,0 +1,6 @@
+# Versions observed in the existing environment used for local preliminary tests.
+# This is CUDA 13.0, not a validated CUDA 12.x submission environment.
+torch==2.13.0+cu130
+numpy==2.5.1
+pyarrow==25.0.0
+tqdm==4.70.0

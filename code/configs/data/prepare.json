@@ -1,0 +1,16 @@
+{
+  "run": {
+    "data_root": "/mnt/disk1/wangxinbei_contest_dataset/C01",
+    "manifest": "artifacts/c01_data_audit/sample_manifest.parquet",
+    "output": "artifacts/data_full"
+  },
+  "split": {
+    "seed": 2026,
+    "validation_fraction": 0.1,
+    "exclude_io_samples": true
+  },
+  "cache": {
+    "patch_size": 16,
+    "limit_per_task": 0
+  }
+}
