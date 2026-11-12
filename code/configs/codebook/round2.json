@@ -1,25 +1,35 @@
+// 第二轮词表：冻结第一轮教师提取Token特征，重新聚类并学习BPE。
+// 已有完整词表可复用；重新构词使用新的空输出目录，并同步学生run.codebook。
+// 项目支持的带注释JSON（JSONC）；从项目根目录运行。数值配置未因添加备注而改变。
 {
+  // 输入、输出与权重来源；相对路径以启动工作目录为准。
   "run": {
-    "data": "artifacts/data_full",
-    "output": "artifacts/structure_research_01/codebook_v2",
-    "teacher_checkpoint": "logs/pretrain_v1/20261111_234233_793915/best.pt"
+    "data": "artifacts/data_full", // 已准备的数据缓存目录，含dataset.json；沿用相同划分比较实验。
+    "output": "artifacts/structure_research_01/codebook_v2", // 词表目录，必须为空或尚不存在；生成的标签要与学生run.codebook一致。
+    "teacher_checkpoint": "logs/pretrain_v1/20261111_234233_793915/best.pt" // 离线提取词表特征的教师；空字符串用原始I/Q，非空用教师编码器；不参与学生训练。
   },
+
+  // 原子词表：只在训练侧拟合聚类中心，全数据按固定中心赋标签。
   "atomic": {
-    "vocab_size": 512,
-    "max_patches": 200000,
-    "iterations": 20,
-    "chunk_size": 4096
+    "vocab_size": 512, // 原子聚类数，至少2；与请求合并数之和须<65535，且需足够特征样本。
+    "max_patches": 200000, // 拟合聚类特征池的采样预算，按任务/长度桶分配；不是全量赋标签记录上限。
+    "iterations": 20, // 球面聚类迭代次数，正整数；增加离线计算，不保证下游收益。
+    "chunk_size": 4096 // 聚类距离计算分块的向量数；减小可降低显存，不改变请求词表大小。
   },
+
+  // 组合词表：仅训练侧拟合BPE规则，验证侧不参与统计或合并学习。
   "emergent": {
-    "merges": 512,
-    "max_span": 5,
-    "fit_sequences": 20000
+    "merges": 512, // BPE最多合并次数，0关闭合并；实际可能更少，词表大小=原子数+实际合并数。
+    "max_span": 5, // 组合单元最大展开的原子位置数，至少1；不是原始I/Q样点数。
+    "fit_sequences": 20000 // 仅训练侧用于拟合BPE规则的去重序列上限；其余记录仍按固定规则赋标签。
   },
+
+  // 设备、精度与显示；配置中的双卡选择只支持指定通信组。
   "runtime": {
-    "batch_size": 128,
-    "seed": 2026,
-    "device": "auto",
-    "threads": 4,
-    "gpus": "2"
+    "batch_size": 128, // 离线提取特征/赋标签的每批记录数；教师较大时减小以节省显存。
+    "seed": 2026, // 非负随机种子；固定初始化与采样，不单独保证所有CUDA算子完全确定。
+    "device": "auto", // 可选auto(优先CUDA)、cpu、cuda；双卡由LOCAL_RANK绑定各自可见卡。
+    "threads": 4, // 每进程PyTorch CPU线程数，正整数；双进程各自生效。
+    "gpus": "2" // 构词仅单进程单卡，如"2"；不支持在此填写双卡列表。
   }
 }

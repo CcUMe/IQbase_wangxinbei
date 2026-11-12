@@ -1,6 +1,9 @@
+// 导出一个模型，剔除训练辅助头；当前默认来源为第一轮微调。
+// 项目支持的带注释JSON（JSONC）；从项目根目录运行。数值配置未因添加备注而改变。
 {
+  // 输入、输出与权重来源；相对路径以启动工作目录为准。
   "run": {
-    "checkpoint": "logs/finetune_v1",
-    "output": "artifacts/structure_research/weights_v1"
+    "checkpoint": "logs/finetune_v1", // 待验证/导出的.pt或运行目录；父目录按latest_run.json解析best.pt，固定比较建议填写精确文件。
+    "output": "artifacts/structure_research/weights_v1" // 导出目录，保存config.json和model.safetensors；推理run.weights应指向这里。
   }
 }

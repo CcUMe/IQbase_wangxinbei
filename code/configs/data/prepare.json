@@ -1,16 +1,23 @@
+// 从审计清单准备训练/验证缓存；已有正确缓存时无需再次执行。
+// 项目支持的带注释JSON（JSONC）；从项目根目录运行。数值配置未因添加备注而改变。
 {
+  // 输入、输出与权重来源；相对路径以启动工作目录为准。
   "run": {
-    "data_root": "/mnt/disk1/wangxinbei_contest_dataset/C01",
-    "manifest": "artifacts/c01_data_audit/sample_manifest.parquet",
-    "output": "artifacts/data_full"
+    "data_root": "/mnt/disk1/wangxinbei_contest_dataset/C01", // 竞赛原始数据根目录；数据准备读取，不是缓存目录。
+    "manifest": "artifacts/c01_data_audit/sample_manifest.parquet", // 数据审计生成的样本清单，记录来源和内容哈希；不是推理输入。
+    "output": "artifacts/data_full" // 新数据缓存目录，必须为空；不覆盖原始数据，改划分后使用独立目录。
   },
+
+  // 数据划分：同波形内容哈希组不跨训练/验证。
   "split": {
-    "seed": 2026,
-    "validation_fraction": 0.1,
-    "exclude_io_samples": true
+    "seed": 2026, // 内容哈希分组划分的种子；改动改变训练/验证划分及数据指纹。
+    "validation_fraction": 0.1, // 验证集目标比例，范围(0,1)；按波形哈希分组，实际记录比例略有偏差。
+    "exclude_io_samples": true // true隔离官方接口样例及同波形重复组，避免它们进入训练/验证缓存。
   },
+
+  // 缓存形状及短测子集；正式比较应使用同一完整缓存。
   "cache": {
-    "patch_size": 16,
-    "limit_per_task": 0
+    "patch_size": 16, // 缓存使用的Patch大小，须与模型及词表一致；修改需要重新准备数据。
+    "limit_per_task": 0 // 每任务每split的短测抽样目标数；0全量，重复组完整保留可能超过目标数。
   }
 }

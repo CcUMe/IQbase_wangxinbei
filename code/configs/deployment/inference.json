@@ -1,21 +1,30 @@
+// 竞赛Parquet→JSONL单模型推理；不读取训练缓存、词表或教师。
+// 项目支持的带注释JSON（JSONC）；从项目根目录运行。数值配置未因添加备注而改变。
 {
+  // 输入、输出与权重来源；相对路径以启动工作目录为准。
   "run": {
-    "input": "/mnt/disk1/wangxinbei_contest_dataset/C01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet",
-    "output": "artifacts/structure_research/predictions.jsonl",
-    "weights": "artifacts/structure_research/weights_v1",
-    "log": "logs/inference.json"
+    "input": "/mnt/disk1/wangxinbei_contest_dataset/C01/rf_signal_sample_io_v1.0/rf_signal_sample_io_input_v1.0.parquet", // 竞赛输入Parquet，包含task、sample_id和iq。
+    "output": "artifacts/structure_research/predictions.jsonl", // 预测JSONL文件，须与输入路径不同；双卡合并后保留原始记录顺序。
+    "weights": "artifacts/structure_research/weights_v1", // 导出权重目录，含config.json和model.safetensors；不能直接填写训练.pt。
+    "log": "logs/inference.json" // 推理耗时及权重来源记录文件；空字符串不写该记录。
   },
+
+  // 设备、精度与显示；配置中的双卡选择只支持指定通信组。
   "runtime": {
-    "device": "auto",
-    "precision": "fp32",
-    "threads": 4,
-    "gpus": "2",
-    "processes": 1
+    "device": "auto", // 可选auto(优先CUDA)、cpu、cuda；双卡由LOCAL_RANK绑定各自可见卡。
+    "precision": "fp32", // 可选fp32、bf16、fp16；CUDA训练fp16使用GradScaler，CPU的fp16按FP32执行。
+    "threads": 4, // 每进程PyTorch CPU线程数，正整数；双进程各自生效。
+    "gpus": "2", // 单卡如"2"，双卡仅"0,1"/"2,3"/"4,5"；与processes配套，不是局部rank编号。
+    "processes": 1 // 可选1或2；单卡1、双卡2，入口自动torchrun；改变卡数不能直接严格resume。
   },
+
+  // 推理读取及分片批量，不影响模型参数。
   "batching": {
-    "batch_size": 128
+    "batch_size": 128 // 推理每次读入的记录数，随后分给各进程；不是每卡训练微批次大小。
   },
+
+  // 推理频谱实现覆盖；null保持导出时的实现。
   "spectrum": {
-    "backend": null
+    "backend": null // 可选null(沿用导出设置)、fft、matmul；覆盖后需验证目标平台数值一致性。
   }
 }

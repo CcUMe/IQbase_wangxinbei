@@ -1,14 +1,19 @@
+// 独立验证下游任务；共用工具配置，当前默认来源为第一轮微调。
+// 项目支持的带注释JSON（JSONC）；从项目根目录运行。数值配置未因添加备注而改变。
 {
+  // 输入、输出与权重来源；相对路径以启动工作目录为准。
   "run": {
-    "data": "artifacts/data_full",
-    "checkpoint": "logs/finetune_v1",
-    "output": "artifacts/structure_research/evaluation_fp32.json"
+    "data": "artifacts/data_full", // 已准备的数据缓存目录，含dataset.json；沿用相同划分比较实验。
+    "checkpoint": "logs/finetune_v1", // 待验证/导出的.pt或运行目录；父目录按latest_run.json解析best.pt，固定比较建议填写精确文件。
+    "output": "artifacts/structure_research/evaluation_fp32.json" // 验证指标JSON文件；换实验时与run.checkpoint配套修改，避免覆盖其他结果。
   },
+
+  // 设备、精度与显示；配置中的双卡选择只支持指定通信组。
   "runtime": {
-    "device": "auto",
-    "gpus": "2",
-    "batch_size": 256,
-    "precision": "fp32",
-    "max_batches": 0
+    "device": "auto", // 可选auto(优先CUDA)、cpu、cuda；双卡由LOCAL_RANK绑定各自可见卡。
+    "gpus": "2", // 独立验证仅单进程单卡，如"2"；不是训练的双卡配置。
+    "batch_size": 256, // 独立验证每批记录数；减小可降低显存，不影响验证范围。
+    "precision": "fp32", // 可选fp32、bf16、fp16；CUDA训练fp16使用GradScaler，CPU的fp16按FP32执行。
+    "max_batches": 0 // 独立验证批数上限，0全量；短测不能替代全量比赛指标。
   }
 }

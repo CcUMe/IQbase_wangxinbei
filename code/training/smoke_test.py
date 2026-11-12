@@ -11,7 +11,7 @@ from copy import deepcopy
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'code'))
-from utils.common import read_json, write_json
+from utils.common import read_config_json, read_json, write_json
 from utils.run_directory import latest_run
 
 
@@ -85,7 +85,7 @@ def main():
     baseline = latest_run(baseline)
     run('resume', [python, 'code/training/train.py', *common, '--config', small, '--output', baseline,
                    '--resume', baseline / 'last.pt', '--max-steps', '6', '--merge-paired'])
-    structure = read_json(ROOT / 'code/configs/smoke/pretrain.json')
+    structure = read_config_json(ROOT / 'code/configs/smoke/pretrain.json')
     reconstruction = deepcopy(structure)
     reconstruction['loss']['pretraining']['weights'].update(reconstruction=1.0, atomic=0.0, emergent=0.0)
     recon_config = args.output / 'reconstruction_config.json'
