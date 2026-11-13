@@ -2,6 +2,8 @@
 
 本项目实现一个共享时频双流基座，完成 23 类调制/波形识别、8 类体制识别和七项参数估计。包含分组数据划分、连续重建预训练、Atomic/Emergent 结构预训练、第二轮词表更新、多任务微调、评估、导出和统一推理。当前用于初步测试，未制作 Docker 镜像。
 
+2026-11-12：监督main.json5已启用单前端统一基座的机制优化：局部BiLSTM/窗口注意力、六值幅相保护、全局谱后移、深层主导调制读出及七参数信号值查询。总参数19.17M、共享91.01%，90项CPU检查及官方样例短流程通过；正式准确率待训练验证。[机理说明](docs/signal_mechanism_optimization.md)、[启动指南](docs/supervised_multiresolution.md)。现有weights未替换。
+
 2026-11-11 诊断后优化已完成。全部 118,182 条本地验证记录上，调制 Accuracy **64.23% → 64.50%**，Macro-F1 **64.15% → 64.45%**；协议 Accuracy 保持 **94.42%**，七项参数误差完全一致。默认 `weights/` 已换为验证后的 96.32M 单模型，共享参数占 97.43%；原默认权重已备份。有效改动是冻结原 95M 共享基座，增加均值/标准差与 I/Q 统计读出并重训调制头。监督对比损失、局部残差前端未胜过控制组，默认关闭。提升有限，深层表征和扩参泛化瓶颈尚未解决，所有代理分均不代表官方成绩。完整实测及失败对照见 [本轮优化报告](artifacts/representation_optimization/20261111_122154_915261/report.md)。
 
 原始基座来源为 `logs/supervised_main/20261110_233950_782228/best.pt`；优化后的完整权重为 `artifacts/representation_optimization/20261111_122154_915261/selected/model.pt`。前期诊断及六组增强对照见 [泛化报告](docs/generalization_20261111.md)，注意力/优化器修复见 [历史报告](docs/attention_repair_report.md)。
@@ -18,14 +20,14 @@
 
 ## 配置驱动启动
 
-当前预训练后微调已加入分阶段解冻、可选分层LR/预训练权重anchor，以及调制/综合最佳检查点，按第一轮、第二轮继承、第二轮随机初始化分别使用独立JSON。候选设置与恢复规则见[微调说明](docs/finetuning.md)，尚未声称带来精度提升。
+预训练后默认从第一步全参微调：任务头峰值LR3e-4、基座3e-5，前3%更新线性预热后cosine衰减至5%，20轮、单卡batch256。三份带注释JSON5区分预训练来源，best.pt按调制准确率选择，并保留综合最佳候选。策略与恢复规则见[微调说明](docs/finetuning.md)；质量收益仍需正式对照验证。
 
 已激活py313环境后，核心入口只需传配置，数据/输出/词表/检查点和GPU均在配置中：
 
 ```bash
 python code/training/build_codebook.py --config code/configs/codebook/round1.json
 python code/training/train.py --config code/configs/pretrain/round1.json
-python code/training/train.py --config code/configs/finetune/round1.json
+python code/training/train.py --config code/configs/finetune/round1.json5
 python code/training/evaluate.py --config code/configs/deployment/evaluation.json
 python code/training/export.py --config code/configs/deployment/export.json
 python code/infer.py --config code/configs/deployment/inference.json
@@ -131,27 +133,27 @@ logs/                          # 推理日志；各实验另有自己的 train.l
 python code/training/train.py --config code/configs/supervised/small.json
 ```
 
-主模型双卡训练：
+新多尺度模型单卡监督训练：
 
 ```bash
-python code/training/train.py --config code/configs/supervised/main.json
+python code/training/train.py --config code/configs/supervised/main.json5
 
-C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest artifacts/supervised_main)
+C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest logs/supervised_main)
 ```
 
-主监督训练使用`supervised/main.json`；模型规模、前端、任务头及优化配方均在其中调整，运行时以保存的`resolved_config.json`为准。配置文件支持`//`、`/* */`注释。`data.batch_size`是每卡微批次；每卡256、累积1次时，双卡有效全局batch为512。cosine、预热和最低学习率比例位于`scheduler`，步数按优化器更新计算。
+主监督训练使用`supervised/main.json5`；模型规模、前端、任务头及优化配方均在其中调整，运行时以保存的`resolved_config.json`为准。配置文件支持`//`、`/* */`注释。当前单卡batch256、累计1，有效batch256。cosine、预热和最低学习率比例位于`scheduler`，步数按优化器更新计算。
 
 `--max-steps 30` 可做短跑；`--merge-paired` 只在训练侧合并同波形的已知跨任务标签，与不合并分别比较。训练按三个任务等配额轮转，任务内按真实长度比例抽样；这是有放回的均衡更新预算，不等同于每轮恰好遍历每条记录一次。
 
-主配置已启用 `model.encoder.qk_normalization` 和 `optimizer.skip_inactive_heads`，峰值学习率为 1e-4。继续相同配方使用 `--resume`；更换优化配方并保留全部任务头时使用 `--warmstart-checkpoint`，它会重置优化器；`--init-checkpoint` 只载入基座。已启动的进程不会自动加载源文件改动。
+当前单前端统一基座由hierarchy控制时频前端/BiLSTM/阶段编码，由encoder控制后半段Transformer，hybrid.topology=serial选串行衔接；从零监督LR=3e-4。原完整pt和先前并行组合pt不能直接resume到当前模型。
 
-也可以在 `code/configs/supervised/main.json` 的 `checkpoint.resume_from` 填入原时间戳目录的 `last.pt`，然后按原命令启动，无需再传 `--resume`；留空表示新训练。`checkpoint.save_every_steps=500` 会在完整优化器更新后定期原子覆盖 `last.pt`，epoch 结束也保存，减少意外中断时损失的进度。续训恢复模型、优化器、cosine、混合精度及 epoch/step，仍写原目录。命令行 `--resume` 优先，`--no-resume` 可忽略配置并新建运行；详见 [配置续训说明](code/configs/README.md#断点续训checkpoint)。
+也可以在 `code/configs/supervised/main.json5` 的 `checkpoint.resume_from` 填入原时间戳目录的 `last.pt`，然后按原命令启动，无需再传 `--resume`；留空表示新训练。`checkpoint.save_every_steps=500` 会在完整优化器更新后定期原子覆盖 `last.pt`，epoch 结束也保存，减少意外中断时损失的进度。续训恢复模型、优化器、cosine、混合精度及 epoch/step，仍写原目录。命令行 `--resume` 优先，`--no-resume` 可忽略配置并新建运行；详见 [配置续训说明](code/configs/README.md#断点续训checkpoint)。
 
-`supervised/main.json`保留用户当前设置：384宽、8层、6头，`classification_pooling="mean_std"`、`physical_statistics=true`、`classification_fp32=true`。它与既有95M基座尺寸不同，不能直接加载该大模型检查点。统计量只由有效I/Q计算，直接测试既有模型精度可使用原`weights/`。
+`supervised/main.json5`使用共享前端→局部BiLSTM/窗口阶段编码→token投影→384×8 Transformer核心，追加幅相值保护与深层主导读出。当前19.17M参数、共享91.01%，没有第二套原始信号前端。
 
 如需热启动既有优化权重`artifacts/representation_optimization/20261111_122154_915261/selected/model.pt`，先使用与其匹配的模型结构，并在run.warmstart_checkpoint填写来源。该合并权重没有原读出训练优化器状态，不能resume；init_checkpoint只保留基座，会重置任务头。
 
-`--output` 指定实验父目录，新训练自动创建上海时区的时间戳子目录，例如 `artifacts/supervised_main/20261110_153000_123456/`。同一命令重复启动会生成不同目录，双卡共享一个目录。终端总览会显示实际路径；父目录的 `latest_run.json` 记录最近创建的运行，上述辅助命令读取该路径。续训应选择确定的检查点，最新目录不等同于最佳模型。
+`--output` 指定实验父目录，新训练自动创建上海时区的时间戳子目录，例如`logs/supervised_main/20261112_180000_123456/`。同一命令重复启动会生成不同目录。终端总览会显示实际路径；父目录的`latest_run.json`记录最近创建的运行，上述辅助命令读取该路径。续训应选择确定的检查点，最新目录不等同于最佳模型。
 
 每次运行目录包含 `best.pt`、`last.pt`、`metrics.json`、`parameter_report.json`、`resolved_config.json`、`train.log`、`events.jsonl` 和 `run_info.json`。`best.pt` 按 `evaluation.selection_metric` 选择，当前主配置为调制准确率，同时始终报告协议与参数误差；`auto` 在监督阶段按本地代理分选择，代理分不是官方成绩。断点续训要求保持配置、数据划分、世界大小、词表及配对合并方式一致，并继续写入检查点所在的原目录：
 
@@ -160,7 +162,7 @@ C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest artifacts/supervis
 `train.log` 保存同样的可读总览、定期进度快照、完整验证表及收尾信息，不再混入 JSON 或终端重绘控制符。机器可读的逐 step/epoch 记录单独写入 `events.jsonl`，完整指标保存在 `metrics.json`。恢复历史 JSON 版日志的运行时，原 `train.log` 会先保留为 `train_legacy.jsonl`（重名时递增后缀），再开始可读日志；旧记录不会丢失。`runtime.progress_bar`、`progress_min_interval` 控制终端进度条，`runtime.log_every` 控制事件及文件内进度快照的步数间隔。
 
 ```bash
-python code/training/train.py --config code/configs/supervised/main.json
+python code/training/train.py --config code/configs/supervised/main.json5
 ```
 
 ## 预训练候选一：I/Q 掩码重建
@@ -204,9 +206,9 @@ python code/training/train.py --config code/configs/pretrain/round2_scratch.json
 按预训练实验选择对应的微调配置，下面三条是不同实验，按需执行：
 
 ```bash
-python code/training/train.py --config code/configs/finetune/round1.json
-python code/training/train.py --config code/configs/finetune/round2_continue.json
-python code/training/train.py --config code/configs/finetune/round2_scratch.json
+python code/training/train.py --config code/configs/finetune/round1.json5
+python code/training/train.py --config code/configs/finetune/round2_continue.json5
+python code/training/train.py --config code/configs/finetune/round2_scratch.json5
 ```
 
 deployment目录下的evaluation.json、export.json和inference.json是共用工具配置，默认来源仍为第一轮微调。评估其他实验时，修改相应检查点、输出及推理权重路径后执行：

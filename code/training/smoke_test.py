@@ -42,7 +42,7 @@ def main():
     python = sys.executable
     stages = []
     def run(name, command, env=None):
-        if name in previous and previous[name]['returncode'] == 0 and name not in ['core_checks', 'config_checks', 'stability_checks', 'reporting_checks', 'contrastive_checks', 'hypothesis_checks', 'resume_checks', 'command_config_checks', 'finetuning_checks']:
+        if name in previous and previous[name]['returncode'] == 0 and name not in ['core_checks', 'config_checks', 'stability_checks', 'reporting_checks', 'contrastive_checks', 'hypothesis_checks', 'resume_checks', 'command_config_checks', 'finetuning_checks', 'process_lifecycle_checks']:
             stages.append(previous[name])
             print(f'[{name}] reused previous passed stage', flush=True)
             return
@@ -71,6 +71,7 @@ def main():
     run('resume_checks', [python, 'code/training/test_resume.py'])
     run('command_config_checks', [python, 'code/training/test_command_config.py'])
     run('finetuning_checks', [python, 'code/training/test_finetuning.py'])
+    run('process_lifecycle_checks', [python, 'code/training/test_process_lifecycle.py'])
     data = args.prepared_data.resolve() if args.prepared_data else args.output / 'data'
     if not args.prepared_data:
         if not args.manifest.exists():

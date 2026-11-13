@@ -4,6 +4,8 @@ import math
 
 from utils.common import TARGETS, read_config_json
 from utils.position import POSITION_DEFAULTS
+from models.multiresolution import PYRAMID_DEFAULTS, READOUT_DEFAULTS, validate_pyramid
+from models.hierarchical import HIERARCHY_DEFAULTS, HYBRID_DEFAULTS, validate_hierarchy
 
 
 DEFAULTS = {
@@ -20,7 +22,11 @@ DEFAULTS = {
                    'scale_embedding': True, 'global_spectrum_input': True, 'multiscale_frontend': False},
         'heads': {'parameter_mode': 'regression', 'classification_hidden_ratio': 0.5,
                   'grid_residual_scale': 0.1, 'parameter_query_temperature': 1.0, 'contrastive_projection_dim': 128,
-                  'classification_pooling': 'mean', 'physical_statistics': False, 'classification_fp32': False},
+                  'classification_pooling': 'mean', 'physical_statistics': False, 'classification_fp32': False,
+                  'multiscale_readout': deepcopy(READOUT_DEFAULTS)},
+        'pyramid': deepcopy(PYRAMID_DEFAULTS),
+        'hierarchy': deepcopy(HIERARCHY_DEFAULTS),
+        'hybrid': deepcopy(HYBRID_DEFAULTS),
     },
     'data': {'batch_size': 128, 'steps_per_epoch': 0, 'merge_paired': False,
              'augmentation': {'phase_rotation_probability': 0.0,
@@ -49,6 +55,7 @@ DEFAULTS = {
     },
     'evaluation': {'every_epochs': 1, 'batch_size': 128, 'max_batches': 0, 'precision': 'fp32',
                    'mask_seed': 12345, 'selection_metric': 'auto',
+                   'early_stopping': {'patience': 0, 'min_delta': 0.001},
                    'proxy_task_weights': {'modulation': 30.0, 'protocol': 30.0, 'parameter': 40.0}},
     'checkpoint': {'resume_from': '', 'save_last': True, 'save_best': True,
                    'save_best_modulation': False, 'save_best_proxy': False,
@@ -99,7 +106,11 @@ def legacy_config(raw):
     for key, value in raw.items():
         if key == 'model':
             for name, option in value.items():
-                groups = [group for group, options in result['model'].items() if name in options]
+                if name in ['pyramid', 'hierarchy', 'hybrid']:
+                    template = {'pyramid': PYRAMID_DEFAULTS, 'hierarchy': HIERARCHY_DEFAULTS, 'hybrid': HYBRID_DEFAULTS}[name]
+                    result['model'][name] = merge_known(template, option, f'model.{name}')
+                    continue
+                groups = [group for group in ['encoder', 'signal', 'heads'] if name in result['model'][group]]
                 if len(groups) != 1:
                     raise ValueError(f'Unknown legacy model setting: {name}')
                 result['model'][groups[0]][name] = option
@@ -138,6 +149,18 @@ def resume_comparison_config(config):
     return result
 
 
+def model_options(c):
+    result = {**{k: v for group in ['encoder', 'signal', 'heads'] for k, v in c['model'][group].items()},
+              'pyramid': deepcopy(c['model']['pyramid']), 'hierarchy': deepcopy(c['model']['hierarchy']),
+              'hybrid': deepcopy(c['model']['hybrid'])}
+    if result['hierarchy']['enabled']:
+        validate_hierarchy(result['hierarchy'], result['multiscale_readout'])
+    if result['hierarchy']['enabled'] and not result['hybrid']['enabled']:
+        result['width'] = result['hierarchy']['stage_widths'][-1]
+        result['depth'] = sum(result['hierarchy']['stage_depths'])
+    return result
+
+
 def validate_config(c):
     def require(condition, message):
         if not condition:
@@ -159,7 +182,7 @@ def validate_config(c):
         elif isinstance(node, (float, int)) and not math.isfinite(node):
             raise ValueError(f'{path} must be finite')
     finite_numbers(c)
-    m = {k: v for group in c['model'].values() for k, v in group.items()}
+    m = model_options(c)
     d, t, o, s, e, r = (c[key] for key in ['data', 'training', 'optimizer', 'scheduler', 'evaluation', 'runtime'])
     require(type(r['seed']) is int and r['seed'] >= 0 and type(e['mask_seed']) is int and e['mask_seed'] >= 0, 'Seeds must be nonnegative integers')
     require(r['progress_min_interval'] >= 0, 'progress_min_interval must be nonnegative')
@@ -172,7 +195,8 @@ def validate_config(c):
                        'max_batches': e['max_batches'], 'save_every_steps': c['checkpoint']['save_every_steps'],
                        'save_every_epochs': c['checkpoint']['save_every_epochs']}.items():
         require(type(value) is int and value >= 0, f'{key} must be a nonnegative integer')
-    require(m['width'] % m['heads'] == 0 and (m['width'] // m['heads']) % 2 == 0, 'Attention head width must be even')
+    if not m['hierarchy']['enabled'] or m['hybrid']['enabled']:
+        require(m['width'] % m['heads'] == 0 and (m['width'] // m['heads']) % 2 == 0, 'Attention head width must be even')
     require(512 % m['patch_size'] == 0 and m['stft_window'] >= m['patch_size'] and (m['stft_window'] - m['patch_size']) % 2 == 0,
             'Patch must divide 512; STFT and patch centers must align')
     require(m['position'] in ['samples', 'window', 'dual', 'physical'], 'Unknown position mode')
@@ -186,7 +210,42 @@ def validate_config(c):
     require(m['spectral_backend'] in ['fft', 'matmul'], 'spectral_backend must be fft or matmul')
     require(m['parameter_mode'] in ['regression', 'grid_residual'], 'Unknown parameter_mode')
     require(type(m['contrastive_projection_dim']) is int and m['contrastive_projection_dim'] > 0, 'contrastive_projection_dim must be a positive integer')
-    require(m['classification_pooling'] in ['mean', 'mean_std'], 'classification_pooling must be mean or mean_std')
+    require(m['classification_pooling'] in ['mean', 'mean_std', 'multiscale_attention_stats'], 'Unknown classification_pooling')
+    pyramid = c['model']['pyramid']
+    hierarchy = c['model']['hierarchy']
+    hybrid = c['model']['hybrid']
+    require(all(type(v['enabled']) is bool for v in [pyramid, hierarchy, hybrid]), 'Architecture enabled flags must be boolean')
+    require(not hybrid['enabled'] or hierarchy['enabled'], 'hybrid.enabled requires hierarchy.enabled')
+    require(hybrid['topology'] in ['parallel', 'serial'], 'hybrid.topology must be parallel or serial')
+    if hierarchy['mechanism']['enabled']:
+        require(hybrid['enabled'] and hybrid['topology'] == 'serial',
+                'Signal-preserving mechanism requires the serial unified backbone')
+    if hybrid['enabled'] and hybrid['topology'] == 'serial':
+        require(m['patch_size'] % math.prod(hierarchy['downsample_strides']) == 0,
+                'Unified stage reduction must divide Transformer patch_size')
+        require(hierarchy['spectrum']['centered_windows'],
+                'Unified frontend requires spectrum.centered_windows=true for aligned sample centers')
+        require(m['position_options']['reference_length'] == 1024,
+                'Unified frontend and cross-layer readout use reference_length=1024')
+    require(not (pyramid['enabled'] and hierarchy['enabled']), 'Choose hierarchy OR pyramid, not both')
+    if pyramid['enabled']:
+        validate_pyramid(pyramid, m['multiscale_readout'], m['patch_size'])
+    if hierarchy['enabled']:
+        validate_hierarchy(hierarchy, m['multiscale_readout'])
+        require(c['finetuning']['layer_lr_decay'] == 1 and c['finetuning']['frontend_lr_factor'] == 1,
+                'Hierarchical supervised training requires uniform backbone LR (layer/frontend factors=1)')
+    require((pyramid['enabled'] or hierarchy['enabled']) == (m['classification_pooling'] == 'multiscale_attention_stats'),
+            'Multi-scale architecture and classification_pooling=multiscale_attention_stats must be enabled together')
+    if pyramid['enabled'] or hierarchy['enabled']:
+        require(t['stage'] == 'supervised', 'Multi-resolution architecture currently supports supervised stage only')
+        require(m['position'] == 'samples', 'Multi-resolution architecture currently requires position=samples')
+        require(m['classification_fp32'], 'Multi-resolution task readouts require classification_fp32=true')
+        require(not any(m[k] for k in ['physical_statistics', 'local_refinement', 'multiscale_frontend']),
+                'Multi-resolution model uses its own readout/frontends; disable legacy statistics/refinement')
+        require(c['loss']['supervised']['contrastive']['weight'] == 0, 'Multi-resolution model currently requires contrastive.weight=0')
+        require(not c['run']['init_checkpoint'], 'Multi-resolution pretraining adaptation is deferred; use random supervised initialization')
+        require(c['finetuning']['strategy'] == 'full' and not c['finetuning']['anchor_weight'],
+                'Multi-resolution supervised verification requires full training without a pretraining anchor')
     require(all(math.isfinite(m[key]) and m[key] > 0 for key in ['mlp_ratio', 'rope_base', 'rms_epsilon', 'classification_hidden_ratio', 'parameter_query_temperature', 'qk_scale']), 'Model scales must be finite and positive')
     require(0 <= m['grid_residual_scale'] and math.isfinite(m['grid_residual_scale']), 'grid_residual_scale must be nonnegative')
     require(all(0 <= m[key] < 1 for key in ['dropout', 'attention_dropout']), 'Dropout must be in [0,1)')
@@ -226,13 +285,17 @@ def validate_config(c):
     require(p['mask']['strategy'] in ['random', 'energy_mixed'] and 0 <= p['mask']['energy_fraction'] <= 1 and p['mask']['energy_floor'] > 0, 'Invalid energy masking')
     require(e['selection_metric'] in ['auto', 'proxy_score', 'protocol_accuracy', 'modulation_accuracy', 'parameter_proxy', 'pretraining_loss'], 'Unknown selection_metric')
     require(e['selection_metric'] == 'auto' or (t['stage'] == 'pretrain') == (e['selection_metric'] == 'pretraining_loss'), 'Selection metric is incompatible with training stage')
+    early = e['early_stopping']
+    require(type(early['patience']) is int and early['patience'] >= 0 and early['min_delta'] >= 0,
+            'Invalid early_stopping patience/min_delta')
+    require(not early['patience'] or not e['max_batches'], 'Early stopping requires full validation (max_batches=0)')
 
 
 def training_options(c):
     """Internal flat view; public files and saved resolved configs remain grouped."""
     u, p = c['loss']['supervised'], c['loss']['pretraining']
     return {**c['runtime'], **c['training'], **c['optimizer'],
-            'model': {k: v for group in c['model'].values() for k, v in group.items()},
+            'model': model_options(c),
             'batch_size': c['data']['batch_size'], 'steps_per_epoch': c['data']['steps_per_epoch'],
             'merge_paired': c['data']['merge_paired'], 'num_workers': c['data']['loader']['num_workers'],
             'augmentation': c['data']['augmentation'],

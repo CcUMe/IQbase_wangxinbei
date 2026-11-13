@@ -46,6 +46,22 @@ def supervised_contrastive(embedding, labels, rows, temperature=.1, gather=True)
 
 def load_with_training_aux(model, state, source_config=None):
     """Warmstart auxiliary changes and add zero-weight std columns to old classifiers."""
+    source_pyramid = (source_config or {}).get('pyramid', {}).get('enabled', False)
+    source_hierarchy = (source_config or {}).get('hierarchy', {}).get('enabled', False)
+    source_hybrid = (source_config or {}).get('hybrid', {}).get('enabled', False)
+    if (source_config is not None and
+            source_config.get('hierarchy', {}).get('mechanism', {}).get('enabled', False) != model.preserve_signal):
+        raise ValueError('Warmstart requires matching signal-preserving mechanism')
+    if (source_config is not None and source_hybrid and model.hybrid and
+            source_config['hybrid'].get('topology', 'parallel') != model.config['hybrid']['topology']):
+        raise ValueError('Warmstart requires matching shared-frontend topology')
+    if model.multiresolution or source_pyramid or source_hierarchy:
+        source_multi = source_pyramid or source_hierarchy
+        if (not model.multiresolution or (source_config is not None and not source_multi)
+                or (source_config is not None and source_hybrid != model.hybrid)
+                or (source_config is not None and (source_hierarchy and not source_hybrid) != model.hierarchical)):
+            raise ValueError('Warmstart requires matching multi-resolution architecture')
+        return model.load_state_dict(state, strict=True)
     current = model.state_dict()
     state = dict(state)
     d = model.config['width']

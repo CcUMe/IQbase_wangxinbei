@@ -33,7 +33,7 @@ python code/training/train.py --config code/configs/pretrain/round1.json
 第一轮即可做下游适配：
 
 ```bash
-python code/training/train.py --config code/configs/finetune/round1.json
+python code/training/train.py --config code/configs/finetune/round1.json5
 ```
 
 它读取logs/pretrain_v1的latest_run.json并加载对应best.pt。要固定某一次实验，将run.init_checkpoint改成其精确.pt路径。
@@ -54,7 +54,7 @@ python code/training/build_codebook.py --config code/configs/codebook/round2.jso
 
 ```bash
 python code/training/train.py --config code/configs/pretrain/round2_continue.json
-python code/training/train.py --config code/configs/finetune/round2_continue.json
+python code/training/train.py --config code/configs/finetune/round2_continue.json5
 ```
 
 预训练输出logs/pretrain_v2，微调输出logs/finetune_v2。run.init_checkpoint非空，代码仅加载backbone；即使新旧词表都为512/1024，编号含义也已改变，因此重置结构头、优化器和cosine周期，不使用第一轮resume。
@@ -63,7 +63,7 @@ python code/training/train.py --config code/configs/finetune/round2_continue.jso
 
 ```bash
 python code/training/train.py --config code/configs/pretrain/round2_scratch.json
-python code/training/train.py --config code/configs/finetune/round2_scratch.json
+python code/training/train.py --config code/configs/finetune/round2_scratch.json5
 ```
 
 预训练输出logs/pretrain_v2_scratch，微调输出logs/finetune_v2_scratch。两个初始化路径及resume_from均为空，使用与继承方案相同的codebook_v2。第二轮两份配置起始模型、损失、预算、学习率计划与GPU设置一致，只有初始化、名称和输出不同；后续可以分别研究适合的学习率。
@@ -85,7 +85,7 @@ python code/infer.py --config code/configs/deployment/inference.json
 ## 预算、参数与恢复
 
 - 三份结构预训练配置沿用整理时用户的当前配方：768宽、12层、6头、Patch16、STFT64；80 epochs、每卡batch256、Atomic/Emergent各1，重建与谱权重0。第一轮新配置不是历史运行预算的精确复现。
-- 微调沿用分阶段配方：任务头500更新、上层1500更新、其余全参，总10000更新；头部峰值LR1e-4、基座1e-5、全程cosine。详见[微调说明](finetuning.md)。
+- 微调统一采用full全参策略：20轮、单卡batch256，头部峰值LR3e-4、基座3e-5，前3%线性预热后cosine至峰值5%；best.pt按调制准确率选择。详见[微调说明](finetuning.md)。
 - reconstruction.json保留原重建对照预算200 epochs；和结构路线做公平研究时，需要主动匹配训练预算及架构，不能直接按现有轮数比较。
 - 掩码默认比例0.3、跨度2、random策略；跨度为初始连续Token段长度。损失在遮挡且有效的位置计算，先按样本归一，再求均值。
 - 扩参时保持预训练与相应微调的encoder/signal和位置编码配置一致。当前supervised/main.json为384宽，与768宽预训练基座不能直接互载。

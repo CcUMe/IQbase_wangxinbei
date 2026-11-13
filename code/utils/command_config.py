@@ -2,7 +2,6 @@
 import argparse
 import os
 from pathlib import Path
-import subprocess
 import sys
 
 from utils.common import read_config_json
@@ -65,6 +64,10 @@ def configured_launch(gpus='', processes=1, device='auto', distributed=False):
     if visible:
         os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(visible)
     if processes > 1:
+        # Supported by this host's torchrun; preserve explicit user overrides.
+        os.environ.setdefault('TORCH_ELASTIC_SHUTDOWN_TIMEOUT', '10')
         command = [sys.executable, '-m', 'torch.distributed.run', '--standalone',
                    f'--nproc_per_node={processes}', *sys.argv]
-        raise SystemExit(subprocess.run(command, env=os.environ.copy()).returncode)
+        # Replace this wrapper instead of creating an extra launcher parent.
+        # IDE stop / terminal SIGINT now reaches the torchrun agent directly.
+        os.execvpe(sys.executable, command, os.environ.copy())

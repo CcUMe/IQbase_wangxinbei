@@ -7,6 +7,10 @@ from torch import nn
 from torch.nn import functional as F
 from utils.signal_statistics import signal_statistics, STATISTICS_DIM
 from utils.position import POSITION_DEFAULTS, position_coordinates
+from models.multiresolution import (READOUT_DEFAULTS, pyramid_options, validate_pyramid,
+    MultiResolutionPyramid, ModulationReadout, ProtocolReadout, ParameterQueries)
+from models.hierarchical import hierarchy_options, validate_hierarchy, HierarchicalBackbone, SharedScaleFusion, HYBRID_DEFAULTS
+from models.signal_mechanisms import DeepAnchoredModulationReadout, fold_values
 
 
 class RotaryAttention(nn.Module):
@@ -136,7 +140,7 @@ class Backbone(nn.Module):
         x = target * visible[..., None]
         return x, target, scale, valid
 
-    def forward(self, iq, lengths, patch_mask=None, sample_rates=None):
+    def forward(self, iq, lengths, patch_mask=None, sample_rates=None, return_context=False):
         x, target, scale, point_valid = self.preprocess(iq, lengths, patch_mask)
         b, t, _ = x.shape
         p = self.patch_size
@@ -151,7 +155,14 @@ class Backbone(nn.Module):
             reliability = (amplitude.squeeze(-1) * F.pad(amplitude[:, :-1, 0], (1, 0))).clamp_max(1)
             magnitude = (real.square() + imag.square()).sqrt().clamp_min(1e-6)
             features.append(torch.stack((real, imag), -1) / magnitude[..., None] * reliability[..., None])
-        time = self.time(torch.cat(features, -1).transpose(1, 2)).transpose(1, 2)
+        if return_context:
+            # Clear padding between convolutions. Otherwise a padded 512-point
+            # record can differ from the same record evaluated at native length.
+            inputs = torch.cat(features, -1) * point_valid[..., None]
+            hidden = self.time[1](self.time[0](inputs.transpose(1, 2))) * point_valid[:, None]
+            time = self.time[2](hidden).transpose(1, 2) * valid[..., None]
+        else:
+            time = self.time(torch.cat(features, -1).transpose(1, 2)).transpose(1, 2)
         # Real-valued fixed DFT convolution, centers exactly equal to time patches.
         with torch.autocast(device_type=x.device.type, enabled=False):
             transformed = F.conv1d(x.float().transpose(1, 2), self.stft_kernels.float(),
@@ -174,7 +185,11 @@ class Backbone(nn.Module):
                     global_power = re.square() + im.square()
                 global_power = torch.roll(global_power, 512, -1) / lengths[:, None]
                 global_power = torch.log1p(global_power)
-        frequency = self.spectrum(local).transpose(1, 2)
+        if return_context:
+            hidden = self.spectrum[1](self.spectrum[0](local * valid[:, None])) * valid[:, None]
+            frequency = self.spectrum[2](hidden).transpose(1, 2) * valid[..., None]
+        else:
+            frequency = self.spectrum(local).transpose(1, 2)
         if self.config['normalize_fusion']:
             time = F.layer_norm(time, (time.shape[-1],))
             frequency = F.layer_norm(frequency, (frequency.shape[-1],))
@@ -199,7 +214,86 @@ class Backbone(nn.Module):
             h = F.layer_norm(h, (h.shape[-1],)) * valid[..., None]
         for block in self.blocks:
             h = block(h, valid, positions)
-        return self.norm(h) * valid[..., None], valid, target
+        encoded = self.norm(h) * valid[..., None]
+        if return_context:
+            return encoded, valid, target, dict(iq=x, scale=scale, point_valid=point_valid, frequency=frequency)
+        return encoded, valid, target
+
+
+class HybridBackbone(Backbone):
+    """Keep original Transformer keys and add one jointly trained detail path."""
+    def __init__(self, config):
+        super().__init__(config)
+        self.detail = HierarchicalBackbone(config, with_readout=False)
+        widths = [config['width'], config['hierarchy']['stage_widths'][-1], config['hierarchy']['stage_widths'][0]]
+        self.hybrid_fusion = SharedScaleFusion(widths, config['hierarchy'])
+
+    def forward(self, iq, lengths, patch_mask=None, sample_rates=None, return_pyramid=False):
+        if patch_mask is not None:
+            raise ValueError('Hybrid backbone currently supports supervised training/inference only')
+        coarse, valid, target, context = super().forward(iq, lengths, sample_rates=sample_rates, return_context=True)
+        if not return_pyramid:
+            return coarse, valid, target
+        detail = self.detail.forward_features(iq, lengths)
+        # Three resolutions, one shared readout: the original base, contextual
+        # detail after staged encoding, and the high-resolution first stage.
+        features = [coarse, detail['features'][-1], detail['features'][0]]
+        masks = [valid, detail['valid'][-1], detail['valid'][0]]
+        center = torch.arange(coarse.shape[1], device=iq.device).float() * self.patch_size + (self.patch_size - 1) / 2
+        centers = [center, detail['centers'][-1], detail['centers'][0]]
+        return self.hybrid_fusion(features, masks, centers, lengths, context['scale'])
+
+
+class UnifiedBackbone(nn.Module):
+    """One shared frontend feeds recurrent/staged encoding and Transformer core."""
+    def __init__(self, config):
+        super().__init__()
+        self.config, self.patch_size = config, config['patch_size']
+        self.stem = HierarchicalBackbone(config, with_readout=False, with_frontend_global=True)
+        reduction = math.prod(config['hierarchy']['downsample_strides'])
+        if self.patch_size % reduction:
+            raise ValueError('Unified frontend stage reduction must divide Transformer patch_size')
+        self.adapter_stride = self.patch_size // reduction
+        d = config['width']
+        self.token_projection = nn.Conv1d(config['hierarchy']['stage_widths'][-1], d,
+                                          self.adapter_stride, stride=self.adapter_stride)
+        self.token_norm = nn.LayerNorm(d)
+        self.position_projection = nn.Sequential(nn.Linear(2, d), nn.Tanh())
+        # Same core module definitions and state keys as the original backbone.
+        self.blocks = nn.ModuleList([Block(d, config['heads'], config['dropout'], config['mlp_ratio'],
+            config['attention_dropout'], config['rope_base'], config['qk_normalization'], config['qk_scale'])
+            for _ in range(config['depth'])])
+        self.norm = nn.LayerNorm(d)
+        widths = [d, config['hierarchy']['stage_widths'][-1], config['hierarchy']['stage_widths'][0]]
+        self.hybrid_fusion = SharedScaleFusion(widths, config['hierarchy'])
+
+    def forward(self, iq, lengths, patch_mask=None, sample_rates=None, return_pyramid=False):
+        if patch_mask is not None:
+            raise ValueError('Unified backbone currently supports supervised training/inference only')
+        detail = self.stem.forward_features(iq, lengths)
+        h = self.token_projection(detail['features'][-1].transpose(1, 2)).transpose(1, 2)
+        valid = torch.arange(h.shape[1], device=iq.device)[None] < (lengths // self.patch_size)[:, None]
+        h = self.token_norm(h) * valid[..., None]
+        positions, coordinates = position_coordinates(lengths, h.shape[1], self.patch_size, self.config['heads'],
+            self.config['position'], self.config['position_options'], sample_rates)
+        h = h + self.position_projection(coordinates) * float(self.config['position_options']['absolute_features'])
+        for block in self.blocks:
+            h = block(h, valid, positions)
+        h = self.norm(h) * valid[..., None]
+        if not return_pyramid:
+            return h, valid, detail['target']
+        # Adapter centers remain (p-1)/2 + j*p for the configured even-stride
+        # stage reductions and non-overlapping final projection.
+        center = torch.arange(h.shape[1], device=iq.device).float() * self.patch_size + (self.patch_size - 1) / 2
+        pyramid = self.hybrid_fusion([h, detail['features'][-1], detail['features'][0]],
+            [valid, detail['valid'][-1], detail['valid'][0]],
+            [center, detail['centers'][-1], detail['centers'][0]], lengths, detail['scale'], detail['late_global'])
+        if detail['signal_features'] is not None:
+            values = detail['signal_features']
+            pyramid['signal_features'] = values
+            pyramid['signal_memory'] = torch.cat([fold_values(values, stride) for stride in
+                [self.patch_size, math.prod(self.config['hierarchy']['downsample_strides']), 1]], 1)
+        return pyramid
 
 
 class RFModel(nn.Module):
@@ -215,20 +309,75 @@ class RFModel(nn.Module):
                         physical_statistics=False, local_refinement=False, classification_fp32=False,
                         scale_embedding=True, global_spectrum_input=True, multiscale_frontend=False)
         self.config = {**defaults, **model_config}
+        self.config['pyramid'] = pyramid_options(model_config.get('pyramid'))
+        self.config['hierarchy'] = hierarchy_options(model_config.get('hierarchy'))
+        self.config['hybrid'] = {**HYBRID_DEFAULTS, **model_config.get('hybrid', {})}
+        self.config['multiscale_readout'] = {**READOUT_DEFAULTS, **model_config.get('multiscale_readout', {})}
+        self.hybrid = self.config['hybrid']['enabled']
+        if self.config['hybrid']['topology'] not in ['parallel', 'serial']:
+            raise ValueError('hybrid.topology must be parallel or serial')
+        self.preserve_signal = self.config['hierarchy']['mechanism']['enabled']
+        if self.preserve_signal and not (self.hybrid and self.config['hybrid']['topology'] == 'serial'):
+            raise ValueError('Signal-preserving mechanism requires the serial unified backbone')
+        self.hierarchical = self.config['hierarchy']['enabled'] and not self.hybrid
+        if self.hybrid and not self.config['hierarchy']['enabled']:
+            raise ValueError('hybrid.enabled requires hierarchy.enabled for the detail encoder')
+        if (self.hierarchical or self.hybrid) and self.config['pyramid']['enabled']:
+            raise ValueError('Choose hierarchy OR legacy pyramid, not both')
+        if self.hierarchical or self.hybrid:
+            validate_hierarchy(self.config['hierarchy'], self.config['multiscale_readout'])
+        if self.hierarchical:
+            self.config['width'] = self.config['hierarchy']['stage_widths'][-1]
+            self.config['depth'] = sum(self.config['hierarchy']['stage_depths'])
+        self.multiresolution = self.config['pyramid']['enabled'] or self.hierarchical or self.hybrid
+        if self.multiresolution:
+            if not self.hierarchical and not self.hybrid:
+                validate_pyramid(self.config['pyramid'], self.config['multiscale_readout'], self.config['patch_size'])
+            if self.config['position'] != 'samples':
+                raise ValueError('Multi-resolution supervised model currently requires position=samples')
+            if any(self.config.get(k, False) for k in ['pretrain_heads', 'contrastive_head', 'local_refinement', 'multiscale_frontend', 'physical_statistics']):
+                raise ValueError('Multi-resolution supervised model does not support legacy refinement/statistics or pretraining/contrastive heads')
+            if self.config['classification_pooling'] != 'multiscale_attention_stats':
+                raise ValueError('Multi-resolution model requires classification_pooling=multiscale_attention_stats')
+            if not self.config['classification_fp32']:
+                raise ValueError('Multi-resolution task readouts require classification_fp32=true')
         supplied = model_config.get('position_options', {})
         self.config['position_options'] = {**POSITION_DEFAULTS, **supplied}
         if 'reference_sample_rate' in model_config and 'reference_sample_rate_hz' not in supplied:
             self.config['position_options']['reference_sample_rate_hz'] = model_config['reference_sample_rate']
-        self.backbone = Backbone(self.config)
+        self.backbone = (UnifiedBackbone(self.config) if self.hybrid and self.config['hybrid']['topology'] == 'serial' else
+                         HybridBackbone(self.config) if self.hybrid else
+                         HierarchicalBackbone(self.config) if self.hierarchical else Backbone(self.config))
         self.schema = schema
         d = self.config['width']
-        classification_width = d * (2 if self.config['classification_pooling'] == 'mean_std' else 1)
-        classification_width += STATISTICS_DIM if self.config['physical_statistics'] else 0
-        hidden = max(1, int(d * self.config['classification_hidden_ratio']))
-        self.heads = nn.ModuleDict({task: nn.Sequential(nn.Linear(classification_width, hidden), nn.GELU(),
-                     nn.Linear(hidden, len(schema['classification_labels'][task]))) for task in ['modulation', 'protocol']})
-        self.heads['queries'] = nn.Embedding(7, d)
-        self.heads['regression'] = nn.Sequential(nn.Linear(d * 2, d), nn.GELU(), nn.Linear(d, 1))
+        if self.multiresolution:
+            readout = self.config['multiscale_readout']
+            if self.hybrid:
+                branch = self.config['hierarchy']
+                widths = [d, branch['stage_widths'][-1], branch['stage_widths'][0]]
+                memory_width, memory_heads, attention_dropout = branch['fusion_width'], branch['fusion_heads'], branch['dropout']
+            elif self.hierarchical:
+                branch = self.config['hierarchy']
+                widths, memory_width, memory_heads = branch['stage_widths'], branch['fusion_width'], branch['fusion_heads']
+                attention_dropout = branch['dropout']
+            else:
+                branch = self.config['pyramid']
+                self.backbone.pyramid = MultiResolutionPyramid(d, self.config['patch_size'], self.config['rope_base'], branch)
+                widths, memory_width, memory_heads = [d, branch['width'], branch['width']], branch['width'], branch['heads']
+                attention_dropout = branch['attention_dropout']
+            self.heads = nn.ModuleDict({
+                'modulation': (DeepAnchoredModulationReadout(widths, len(schema['classification_labels']['modulation']), readout,
+                                  self.config['hierarchy']['mechanism']) if self.preserve_signal else
+                               ModulationReadout(widths, len(schema['classification_labels']['modulation']), readout)),
+                'protocol': ProtocolReadout(widths, len(schema['classification_labels']['protocol']), readout),
+                'queries': ParameterQueries(widths, memory_width, memory_heads, attention_dropout,
+                    self.config['parameter_query_temperature'], carrier_dim=6 if self.preserve_signal else 0),
+                'regression': nn.ModuleList([nn.Sequential(nn.Linear(memory_width * 2 + (6 if self.preserve_signal else 0), readout['parameter_hidden']),
+                    nn.GELU(), nn.Linear(readout['parameter_hidden'], 1)) for _ in range(7)])})
+            grid_width = memory_width * 2 + (6 if self.preserve_signal else 0)
+        else:
+            self._legacy_heads(d, schema)
+            grid_width = d * 2
         # Timing fields stay continuous even when a smoke subset has few values.
         self.grid_indices = [j for j, values in enumerate(parameter_grids) if j in [0, 1, 2, 6] and 1 < len(values) <= 64]
         self.grids = nn.ModuleDict()
@@ -236,8 +385,10 @@ class RFModel(nn.Module):
         for j in self.grid_indices:
             self.register_buffer(f'grid_values_{j}', (torch.tensor(parameter_grids[j]) - means[j]) / stds[j], persistent=False)
             if self.config['parameter_mode'] == 'grid_residual':
-                self.grids[str(j)] = nn.Linear(d * 2, len(parameter_grids[j]))
+                self.grids[str(j)] = nn.Linear(grid_width, len(parameter_grids[j]))
         self.aux = nn.ModuleDict()
+        classification_width = d * (2 if self.config['classification_pooling'] == 'mean_std' else 1)
+        classification_width += STATISTICS_DIM if self.config['physical_statistics'] else 0
         if self.config['contrastive_head']:
             self.aux['contrastive'] = nn.Sequential(nn.Linear(classification_width, d), nn.GELU(),
                                                   nn.Linear(d, self.config['contrastive_projection_dim']))
@@ -247,10 +398,34 @@ class RFModel(nn.Module):
                 if self.config[f'{kind}_vocab']:
                     self.aux[kind] = nn.Linear(d, self.config[f'{kind}_vocab'])
 
+    def _legacy_heads(self, d, schema):
+        # Preserve historical parameter names and construction order.
+        classification_width = d * (2 if self.config['classification_pooling'] == 'mean_std' else 1)
+        classification_width += STATISTICS_DIM if self.config['physical_statistics'] else 0
+        hidden = max(1, int(d * self.config['classification_hidden_ratio']))
+        self.heads = nn.ModuleDict({task: nn.Sequential(nn.Linear(classification_width, hidden), nn.GELU(),
+                     nn.Linear(hidden, len(schema['classification_labels'][task]))) for task in ['modulation', 'protocol']})
+        self.heads['queries'] = nn.Embedding(7, d)
+        self.heads['regression'] = nn.Sequential(nn.Linear(d * 2, d), nn.GELU(), nn.Linear(d, 1))
+
     def encode(self, iq, lengths, patch_mask=None, sample_rates=None):
         return self.backbone(iq, lengths, patch_mask, sample_rates)
 
     def forward(self, iq, lengths, patch_mask=None, return_pretrain=False, sample_rates=None):
+        if self.multiresolution:
+            if patch_mask is not None or return_pretrain:
+                raise ValueError('Multi-resolution model currently supports supervised training/inference only')
+            if self.hierarchical or self.hybrid:
+                pyramid = self.backbone(iq, lengths, sample_rates=sample_rates, return_pyramid=True)
+            else:
+                h, valid, _, context = self.backbone(iq, lengths, sample_rates=sample_rates, return_context=True)
+                pyramid = self.backbone.pyramid(h, valid, context, lengths)
+            # Heads, variance, attention probabilities and scalar losses use FP32.
+            with torch.autocast(device_type=iq.device.type, enabled=False):
+                output = {task: self.heads[task](pyramid) for task in ['modulation', 'protocol']}
+                features = self.heads['queries'](pyramid, lengths)
+                reg = torch.cat([head(features[:, j]) for j, head in enumerate(self.heads['regression'])], -1)
+                return self._decode_parameters(output, features, reg)
         h, valid, target = self.encode(iq, lengths, patch_mask, sample_rates)
         pooled = h.sum(1) / valid.sum(1, keepdim=True).clamp_min(1)
         classification_h = h.float() if self.config['classification_fp32'] else h
@@ -272,6 +447,13 @@ class RFModel(nn.Module):
         local = torch.einsum('bjn,bnd->bjd', weights, h)
         features = torch.cat((local, pooled[:, None].expand(-1, 7, -1)), -1)
         reg = self.heads['regression'](features).squeeze(-1)
+        output = self._decode_parameters(output, features, reg)
+        if return_pretrain:
+            output['tokens'], output['token_valid'], output['reconstruction_target'] = h, valid, target
+            output['pretrain'] = {name: head(h) for name, head in self.aux.items()}
+        return output
+
+    def _decode_parameters(self, output, features, reg):
         output['grid_logits'] = {}
         if self.config['parameter_mode'] == 'grid_residual':
             decoded = []
@@ -284,9 +466,6 @@ class RFModel(nn.Module):
                     decoded.append(reg[:, j])
             reg = torch.stack(decoded, -1)
         output['parameters'] = reg
-        if return_pretrain:
-            output['tokens'], output['token_valid'], output['reconstruction_target'] = h, valid, target
-            output['pretrain'] = {name: head(h) for name, head in self.aux.items()}
         return output
 
     def parameter_report(self):

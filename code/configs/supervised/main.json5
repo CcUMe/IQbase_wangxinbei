@@ -1,0 +1,250 @@
+// 当前监督入口：随机初始化的三尺度共享基座。直接运行本文件即可验证新架构。
+// 一套共享时频前端→BiLSTM→阶段式编码→原Transformer核心；无第二套原始信号前端。
+// 先不接入预训练/微调；init_checkpoint和warmstart_checkpoint均留空。
+{
+  "schema_version": 2, // 配置格式版本，当前固定为2；不是实验轮次。
+
+  // 实验身份：用于记录，不控制模型结构。
+  "experiment": {
+    "name": "main", // 实验标识；复制新实验时与输出目录一起修改。
+    "description": "从零监督：单前端保留局部幅相，窗口时序/局部编码＋全局Transformer；深层主导调制读出及七字段信号值查询。"
+  },
+
+  // 输入、输出与权重来源；相对路径以启动工作目录为准。
+  "run": {
+    "data": "artifacts/data_full", // 已准备的数据缓存目录，含dataset.json；沿用相同划分比较实验。
+    "output": "logs/supervised_main", // 自动增加上海时间戳；含pt、resolved_config.json、train.log、events.jsonl。
+    "codebook": "", // 结构标签目录，含codebook.json及标签npy；监督微调留空。
+    "init_checkpoint": "", // 仅加载共享基座，重建任务头和优化器；可填精确.pt或通过latest_run.json定位的父目录。
+    "warmstart_checkpoint": "" // 同阶段完整模型热启动，保留任务头但重建优化器；与init_checkpoint互斥，空字符串关闭。
+  },
+
+  // hierarchy控制统一主干前半段；encoder控制后半段Transformer；serial将两者串接。
+  "model": {
+    "encoder": {
+      "width": 384, // 原Transformer主干宽度；需要扩到既有大基座时按对应权重改为768。
+      "depth": 8, // 保留原Transformer核心层数，接收阶段编码之后的token。
+      "heads": 6, // 原Transformer注意力头数，每头宽度必须为偶数。
+      "mlp_ratio": 4.0,
+      "dropout": 0.1,
+      "attention_dropout": 0.1,
+      "rope_base": 10000.0,
+      "qk_normalization": true,
+      "qk_scale": 1.0
+    },
+    "hybrid": {
+      "enabled": true,
+      "topology": "serial" // 单前端串行统一主干；parallel仅供历史双前端checkpoint使用。
+    },
+    "hierarchy": {
+      "enabled": true, // 统一主干的共享前半段，输出继续送入Transformer。
+      "stage_widths": [64, 128, 192], // 统一主干前半段的阶段宽度；后半段Transformer由encoder.width控制。
+      "stage_depths": [1, 2, 2], // 前半段各阶段局部卷积＋局部窗口注意力＋SwiGLU块数。
+      "downsample_strides": [2, 2], // 阶段之间的压缩倍率；1024→512→256，512→256→128。
+      "stem_complex_channels": 32, // 原始I/Q复数stem输出复通道数；32复通道=64实通道。
+      "conv_kernel": 5, // 时域stem和各阶段局部卷积的奇数核长，时间分辨率保持不变。
+      "lstm_hidden": 32, // 每个方向隐藏宽度；双向输出64，在第一次下采样前建模。
+      "lstm_layers": 2, // 融合后的BiLSTM层数；机制开启时按有效长度切成局部窗，在第一次下采样前建模。
+      "lstm_precision": "fp32", // fp32稳定默认；autocast跟随外部精度，需目标设备支持。
+      "mlp_ratio": 4.0, // 各阶段前馈容量；SwiGLU按等量级参数折算隐藏宽度。
+      "fusion_width": 192, // 跨尺度摘要交互及参数查询memory的公共维度。
+      "fusion_heads": 3, // 摘要/参数跨注意力头数；fusion_width/heads必须为偶数。
+      "dropout": 0.1, // BiLSTM层间、阶段块、跨尺度交互的Dropout。
+      "residual_scale": 0.1, // 阶段及跨尺度残差的可学习缩放初值，须>0。
+      "mechanism": {
+        "enabled": true, // 保留局部信号值、限制前半段全局混合、深层主导调制读出。
+        "recurrent_window": 128, // BiLSTM在128点窗口内建模，窗口间不传隐藏状态；须整除512。
+        "attention_window": 16, // 阶段注意力只在局部16-token窗口内；相邻块交替半窗偏移，不循环首尾。
+        "signal_gain": 0.1, // 原归一化I/Q及幅相描述折叠投影后回注各阶段的初始增益。
+        "detail_max_ratio": 0.25, // 调制读出局部修正的逐维绝对幅度上限，相对单位方差深层描述。
+        "detail_initial_ratio": 0.1 // 初始修正幅度；训练可调整，但始终小于max_ratio。
+      },
+      "spectrum": {
+        "i_window": 31, // I通道Blackman窗口，奇数；hop固定1，保持原时间分辨率。
+        "i_nfft": 128, // I通道DFT频点总数；不代表真实采样率。
+        "i_bins": 32, // 保留前32个频点的实/虚部，共64通道；不会静默丢弃虚部。
+        "iq_window": 63, // 奇数窗口使局部谱与I-STFT都准确居中于原样点，保留完整DFT频率网格。
+        "centered_windows": true // 对称窗＋奇数长度，避免两个频谱视图出现半样点中心偏差。
+      }
+    },
+    "signal": {
+      "patch_size": 16, // Transformer token相对原始样点的累计步长；阶段压缩后继续投影至P16。
+      "global_spectrum": true, // 全局谱只计算一次；机制优化后仅在深层跨层读出时加入，不广播干扰早期局部编码。
+      "spectral_backend": "fft", // 全局谱可选fft/matmul；局部两种频谱均为普通实数卷积DFT。
+      "position": "samples", // 统一采用样点位置和有效长度，不推测真实fs或符号周期。
+      "rms_epsilon": 1e-6 // 有效I/Q RMS归一化下限；原始log RMS侧信息保留给参数任务。
+    },
+    "heads": {
+      "parameter_mode": "grid_residual", // 训练集满足条件的字段用网格期望＋残差，时间字段连续回归。
+      "grid_residual_scale": 0.1, // 标准化参数空间的tanh残差幅度。
+      "parameter_query_temperature": 1.0, // 七字段查询的注意力温度，须>0。
+      "classification_pooling": "multiscale_attention_stats", // 机制开启时：Transformer深层统计为主，局部统计/幅相值提供有界修正；一个分类器。
+      "physical_statistics": false, // 不附加旧手工统计特征。
+      "classification_fp32": true, // 三任务读出与池化统计使用FP32。
+      "multiscale_readout": {
+        "projection_width": 256, // 三阶段各投影至相同维数后拼接。
+        "modulation_hidden": 256, // 调制分类器隐藏宽度。
+        "protocol_hidden": 128, // 协议分类器隐藏宽度。
+        "parameter_hidden": 128, // 七个独立参数MLP各自隐藏宽度。
+        "dropout": 0.1,
+        "variance_epsilon": 1e-6
+      }
+    }
+  },
+
+  // 训练采样和加载；按长度组批、任务均衡抽样，不保证每轮逐条遍历。
+  "data": {
+    "batch_size": 256, // 每卡每微批次的记录数；有效batch=此值×processes×gradient_accumulation_steps。
+    "steps_per_epoch": 0, // 每个显示epoch的优化器更新数；0按数据量、全局batch推算，不代表无训练。
+    "merge_paired": false, // true在训练侧合并同波形已知的跨任务标签；不从验证侧获取标签。
+    // 仅监督训练的数据增强；概率0关闭，预训练不使用本组。
+    "augmentation": {
+      "phase_rotation_probability": 0.0, // 当前关闭，避免改变参数任务或抹去任务所需信息。
+      "modulation_only": {
+        "phase_rotation_probability": 0.0, // 仅有调制标签、无协议及有效参数标签的记录做随机相位旋转的概率，0关闭。
+        "circular_shift_probability": 0.0 // 仅有调制标签、无协议及有效参数标签的记录做循环移位的概率，0关闭。
+      }
+    },
+    // 抽到哪些任务由这里控制；任务损失倍率由loss.supervised.task_weights控制。
+    "sampling": {
+      "mode": "balanced", // 可选balanced(任务轮转)、weighted(按配置权重抽任务)、proportional(按任务记录数)。
+      "task_probabilities": {
+        "modulation": 1.0, // 仅weighted模式生效：调制任务抽样相对权重；不是损失权重。
+        "protocol": 1.0, // 仅weighted模式生效：协议任务抽样相对权重，须>0。
+        "parameter": 1.0 // 仅weighted模式生效：参数任务抽样相对权重，须>0。
+      }
+    },
+    // DataLoader设置；worker数与预取影响CPU内存和吞吐。
+    "loader": {
+      "num_workers": 4, // 每进程数据加载worker数；0在主进程加载，双卡总worker数会翻倍。
+      "pin_memory": true, // true使用页锁定内存，供CUDA拷贝使用；会增加主机内存压力。
+      "persistent_workers": false, // 仅num_workers>0时生效；true跨epoch保留worker。
+      "prefetch_factor": 2 // 每worker预取批次数，须>0；仅num_workers>0时传给DataLoader。
+    }
+  },
+
+  // 预算按优化器更新计；epochs与steps_per_epoch共同决定学习率总周期。
+  "training": {
+    "stage": "supervised", // 可选supervised(真实标签监督/微调)、pretrain(掩码预训练)；只优化对应阶段损失。
+    "epochs": 40, // 从零监督上限；全量验证可提前停止。不是预训练微调的20轮预算。
+    "max_steps": 0, // 优化器更新停止上限，0不额外截断；不缩短原cosine计划。
+    "gradient_accumulation_steps": 1, // 每次优化器更新累积的微批次数；增大提高有效batch，降低更新频率。
+    "gradient_clip": 1.0 // 梯度全局范数裁剪上限；0关闭裁剪，非有限梯度仍会报错。
+  },
+
+  // 优化器及参数组；所有阶段使用同一优化器，冻结参数grad=None。
+  "optimizer": {
+    "name": "adamw", // 当前实现仅支持adamw，不可只改字符串切换为其他优化器。
+    "learning_rate": 0.0003, // 全部随机初始化，因此共享基座和任务头使用相同峰值LR。
+    "backbone_lr_factor": 1.0, // 基座相对任务头的LR倍率，须>0；微调常设<1，冻结阶段仍不更新基座。
+    "weight_decay": 0.01, // AdamW权重衰减，0关闭；与anchor约束的参考点和作用不同。
+    "betas": [0.9, 0.999], // AdamW一阶、二阶动量系数，两个值均在[0,1)；不是学习率。
+    "eps": 1e-08, // AdamW分母稳定项，须>0；不是数据归一化epsilon。
+    "exclude_bias_and_norm_from_decay": true, // 偏置及一维归一化参数不做权重衰减。
+    "skip_inactive_heads": true // 生产训练入口要求true：无有效目标的头grad置None，避免AdamW动量/衰减误更新。
+  },
+
+  // 学习率按优化器更新推进，不按微批次或显示epoch推进。
+  "scheduler": {
+    "name": "cosine", // 可选cosine(预热后余弦衰减)、constant(预热后保持峰值)；按优化器更新推进。
+    "warmup_steps": 500, // 学习率线性预热更新数；与warmup_ratio二选一，另一项设0，须小于总计划。
+    "warmup_ratio": 0.0, // 按总计划更新数计算预热比例，[0,1)；使用时warmup_steps必须为0。
+    "warmup_start_factor": 0.0, // 学习率预热起点相对峰值的比例，[0,1]；首个实际更新已前进一步。
+    "min_lr_ratio": 0.05 // cosine最终LR=1.5e-5；提前停止未必到达终点。
+  },
+
+  // 只使用training.stage对应的目标；保留另一阶段配置不代表同时优化。
+  "loss": {
+    // 仅supervised生效：分类CE、有效参数回归及可选辅助目标。
+    "supervised": {
+      "task_weights": {
+        "modulation": 1.0, // 调制CE损失倍率；0关闭该目标，与任务抽样权重独立。
+        "protocol": 1.0, // 协议CE损失倍率；0关闭该目标。
+        "parameter": 1.0 // 七参数回归整体损失倍率；不代替grid_weight设置。
+      },
+      "label_smoothing": 0.0, // 分类标签平滑强度，[0,1)；0关闭，只用于监督分类CE。
+      "regression": "mse", // 可选mse或huber；均在训练侧标准化的有效参数标签上计算。
+      "huber_delta": 1.0, // 仅regression=huber生效，须>0；单位为标准化目标单位。
+      // 按当前有有效标签且权重>0的参数字段加权归一化。
+      "parameter_weights": {
+        "symbol_rate": 1.0, // 符号率回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+        "bandwidth": 1.0, // 带宽回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+        "frequency_shift": 1.0, // 频移回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+        "pulse_width": 1.0, // 脉宽回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+        "pri": 1.0, // 脉冲重复间隔回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+        "time_delay": 1.0, // 时延回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+        "number_of_pulses": 1.0 // 脉冲数回归损失的相对权重；0关闭该字段回归，但不自动关闭网格辅助项。
+      },
+      "grid_weight": 0.1, // 参数网格分类辅助损失倍率，0关闭；仅grid_residual且存在网格头时生效。
+      // 可选调制监督对比目标；weight=0时不建立辅助投影头。
+      "contrastive": {
+        "weight": 0, // 调制监督对比损失倍率，0关闭；不替代分类CE。
+        "temperature": 0.1, // 对比softmax温度，须>0；越小越强调高相似度的区分。
+        "gather_distributed": true // true使用可反传的跨卡对比样本；false仅用本卡样本，单卡无跨卡收集。
+      }
+    },
+    // 当前stage=supervised，本分组不参与优化；微调不执行结构预测或重建。
+    "pretraining": {
+      "mask": {
+        "ratio": 0.3, // 有效Token遮挡比例，范围(0,1)；只在pretrain阶段使用。
+        "span": 2, // 初始连续遮挡段长度，单位Token；多个段可相邻，至少保留可见上下文。
+        "strategy": "random", // 可选random(随机段遮挡)、energy_mixed(部分按能量选择、其余随机)。
+        "energy_fraction": 0.5, // 仅energy_mixed生效：按能量选点份额，[0,1]；0全随机。
+        "energy_floor": 0.05 // 仅energy_mixed生效：能量概率平滑底值系数，须>0，避免低能量点概率为0。
+      },
+      // 各损失倍率须非负，至少一个有效目标>0；纯结构常用atomic/emergent各1，另两项0。
+      "weights": {
+        "reconstruction": 0.0, // 原始I/Q连续重建损失倍率，0不参与优化；可仍记录重建分项。
+        "atomic": 1.0, // 原子结构标签交叉熵倍率，0关闭；正值需run.codebook提供标签。
+        "emergent": 1.0, // 组合结构标签交叉熵倍率，0关闭可做Atomic-only；需run.codebook。
+        "spectrum": 0.0 // 局部Patch功率谱连续重建损失倍率，0关闭；它仍属于重建类目标。
+      },
+      "equalize_emergent_spans": false // true按组合展开长度缩放回填CE；false每个原始位置等权，需独立比较。
+    }
+  },
+
+  // 验证及best.pt选择；下游收益应比较任务指标，不能只看预训练loss。
+  "evaluation": {
+    "every_epochs": 1, // 每N个完整epoch验证；最终轮/停止上限结束时仍会验证。
+    "batch_size": 256, // 验证每批记录数，与训练batch独立；不参与梯度累积。
+    "max_batches": 0, // 验证批数上限，0全量；非0仅短测，不能当完整验证集指标。
+    "precision": "fp32", // 可选fp32、bf16、fp16；验证精度独立于训练，正式比较保持一致。
+    "mask_seed": 12345, // 仅预训练验证的固定遮挡种子，使同一目标下的验证loss可比较。
+    "selection_metric": "modulation_accuracy", // auto自动选择；监督可选proxy_score/modulation_accuracy/protocol_accuracy/parameter_proxy；预训练可选pretraining_loss。
+    "early_stopping": {
+      "patience": 8, // 连续8次全量验证未达到最小改善即停止；0关闭，不影响best的逐次保存。
+      "min_delta": 0.001 // selection_metric的绝对单位；accuracy下0.001=0.1个百分点。
+    },
+    "proxy_task_weights": {
+      "modulation": 30.0, // 本地综合代理指标的调制权重；只用于评估/选模，不影响训练损失。
+      "protocol": 30.0, // 本地综合代理指标的协议权重；代理指标不等于官方成绩。
+      "parameter": 40.0 // 本地综合代理指标的参数权重；需与另两项配套比较。
+    }
+  },
+
+  // 保存及严格恢复；换词表用init，原任务中断用resume，二者不同。
+  "checkpoint": {
+    "resume_from": "", // 空字符串新建运行；非空恢复完整训练状态并写回原目录，优先于配置init/warmstart。
+    "save_last": true, // true保存最新完整状态；false也关闭轮内定期last.pt保存。
+    "save_best": true, // 只控制best.pt；best_modulation.pt及best_proxy.pt由各自开关独立控制。
+    "save_best_modulation": true, // 同时保存调制准确率最优权重。
+    "save_best_proxy": true, // 同时保存综合代理分最优权重，最终只能选择一份模型提交。
+    "save_every_steps": 500, // 每N次完整优化器更新保存last.pt；0关闭轮内定期保存，需save_last=true。
+    "save_every_epochs": 0 // 每N个完整epoch另存快照；0关闭，不影响save_last/save_best。
+  },
+
+  // 设备、精度与显示；配置中的双卡选择只支持指定通信组。
+  "runtime": {
+    "device": "auto", // 可选auto(优先CUDA)、cpu、cuda；双卡由LOCAL_RANK绑定各自可见卡。
+    "gpus": "1", // 单卡物理GPU编号；也可用命令行--gpus覆盖。
+    "processes": 1, // 单卡训练；gradient_accumulation_steps=1，不开双卡/累计。
+    "precision": "bf16", // 可选fp32、bf16、fp16；CUDA训练fp16使用GradScaler，CPU的fp16按FP32执行。
+    "seed": 2026, // 非负随机种子；固定初始化与采样，不单独保证所有CUDA算子完全确定。
+    "threads": 4, // 每进程PyTorch CPU线程数，正整数；双进程各自生效。
+    "log_every": 50, // 每N次优化器更新写详细训练事件及可读进度快照；不控制验证频率。
+    "deterministic": false, // true要求确定性算子，遇到不支持的算子可能报错；false使用正常实现。
+    "allow_tf32": false, // true允许支持设备上的FP32矩阵乘法使用TF32；不是BF16/FP16开关。
+    "progress_bar": true, // true显示逐epoch进度条；false仍输出总览与验证摘要。
+    "progress_min_interval": 0.5 // 进度条最小刷新间隔，单位秒；0逐更新刷新，不影响实际统计。
+  }
+}

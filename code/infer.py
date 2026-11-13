@@ -16,6 +16,7 @@ from utils.common import TARGETS, load_safetensors, read_json, runtime, write_js
 from utils.engine import autocast
 from utils.command_config import command_defaults, configured_launch
 from utils.inference_output import merge_prediction_shards
+from utils.process_lifecycle import managed_entrypoint
 
 
 class Predictor:
@@ -61,6 +62,7 @@ class Predictor:
         return result
 
 
+@managed_entrypoint('推理')
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config', type=Path, help='Optional inference runtime settings; distinct from weights/config.json')
@@ -116,7 +118,6 @@ def main():
     else:
         temporary.replace(args.output)
     if rank != 0:
-        dist.destroy_process_group()
         return
     record = dict(rows=rows, elapsed_seconds=time.monotonic() - started, device=str(predictor.device), output=str(args.output),
                   weights=str(args.weights.resolve()), source_checkpoint=predictor.config.get('source_checkpoint'),
@@ -124,8 +125,6 @@ def main():
     if args.log:
         write_json(args.log, record)
     print(json.dumps(record))
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 
 if __name__ == '__main__':

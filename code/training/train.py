@@ -30,6 +30,8 @@ from utils.contrastive import load_with_training_aux
 from utils.command_config import checkpoint_reference, configured_launch
 from utils.position import POSITION_DEFAULTS
 from utils.finetuning import FineTuneController
+from utils.process_lifecycle import managed_entrypoint
+from utils.early_stopping import EarlyStopping
 
 
 def build_optimizer(model, settings, finetuning=None):
@@ -97,6 +99,7 @@ def configure_checkpoint_start(args, settings):
     settings['checkpoint']['resume_from'] = str(args.resume) if args.resume else ''
 
 
+@managed_entrypoint('训练')
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--data', type=Path)
@@ -196,6 +199,8 @@ def main():
         load_with_training_aux(model, initial['model'], initial['model_config'])
         initialization_source_steps = initial['global_step'] + initial.get('repair_source_steps', initial.get('initialization_source_steps', 0))
     if args.init_checkpoint:
+        if model.multiresolution:
+            raise ValueError('Multi-resolution pretraining adaptation is deferred; start supervised training without init-checkpoint')
         initial = load_checkpoint(args.init_checkpoint)
         for key in ['patch_size', 'stft_window', 'position']:
             if initial['model_config'].get(key) != model.config.get(key):
@@ -255,6 +260,9 @@ def main():
         batch_start = 0 if previous['epoch_complete'] else previous['batch_index'] + 1
         if cap and cap <= global_step:
             raise ValueError('max-steps must exceed the saved global step when resuming')
+    early_stopping = EarlyStopping(resolved['evaluation']['early_stopping'],
+                                    previous.get('early_stopping') if previous else None)
+    early_stop_requested = False
     fine = None
     if args.stage == 'supervised':
         if ((resolved['finetuning']['strategy'] == 'gradual' or resolved['finetuning']['anchor_weight'])
@@ -299,7 +307,7 @@ def main():
         training_overview(resolved, args, device, world, len(train_data), len(val_data), info,
                           report, steps, warmup, cap, global_step, epoch_start, codebook)
         if fine:
-            print(f'微调阶段 | step {global_step:,} | {fine.phase} | 可训练参数 '
+            print(f'参数更新阶段 | step {global_step:,} | {fine.phase} | 可训练参数 '
                   f'{fine.state(global_step)["trainable_parameters"]:,}', flush=True)
     def checkpoint_payload(epoch, batch_index, epoch_complete):
         return dict(model=module.state_dict(), model_config=module.config, schema=info['schema'],
@@ -310,13 +318,14 @@ def main():
             epoch=epoch, batch_index=batch_index, epoch_complete=epoch_complete, global_step=global_step,
             best_score=best, metrics=metrics, validation_global_step=validation_global_step,
             best_metrics=best_metrics,
+            early_stopping=early_stopping.state_dict(),
             finetuning_state=fine.state(global_step) if fine else None,
             finetune_anchor=fine.anchor_state() if fine else None,
             initialization_source_steps=initialization_source_steps)
 
     last_assessment = {'improved': False, 'saved': []}
     def assess(epoch, batch_index, complete, trigger):
-        nonlocal metrics, best, validation_global_step, last_assessment
+        nonlocal metrics, best, validation_global_step, last_assessment, early_stop_requested
         if world > 1:
             dist.barrier()
         if rank == 0:
@@ -329,6 +338,7 @@ def main():
                     resolved['evaluation']['precision'], resolved['evaluation']['max_batches'],
                     resolved['evaluation']['proxy_task_weights'])
             score = selection_score(metrics, resolved['evaluation']['selection_metric'], args.stage)
+            early_stop_requested = early_stopping.update(score)
             improved = score > best
             best = max(best, score)
             wins = {}
@@ -355,7 +365,11 @@ def main():
                       'parameter_rmse': {k:v['rmse'] for k,v in metrics['parameters'].items()}})
             log_json(args.output / 'events.jsonl', dict(event='validation', epoch=epoch, step=global_step,
                 trigger=trigger, score=score, best=best, improved=improved,
-                summary=summary, finetuning_state=fine.state(global_step) if fine else None), console=False)
+                summary=summary, early_stopping=early_stopping.state_dict(),
+                finetuning_state=fine.state(global_step) if fine else None), console=False)
+            if early_stop_requested:
+                print(f'提前停止 | 连续 {early_stopping.bad_validations} 次完整验证未达到最小改善 '
+                      f'{early_stopping.min_delta:g} | selection={resolved["evaluation"]["selection_metric"]}', flush=True)
             if args.stage == 'supervised' and trigger != 'epoch':
                 classification_summary(metrics)
                 print('  参数 RMSE | ' + ' | '.join(f'{k}={v["rmse"]:.3e}' for k,v in metrics['parameters'].items()
@@ -363,6 +377,9 @@ def main():
             last_assessment = {'improved': improved, 'saved': saved}
         validation_global_step = global_step  # All ranks must agree about duplicate validation.
         if world > 1:
+            flag = torch.tensor(int(early_stop_requested), device=device)
+            dist.broadcast(flag, src=0)
+            early_stop_requested = bool(flag.item())
             dist.barrier()
         if fine:
             fine.train_mode()
@@ -400,7 +417,7 @@ def main():
                             del model
                             model = wrap_ddp()
                         if rank == 0:
-                            print(f'微调阶段 | step {global_step:,} | {fine.phase} | 可训练参数 '
+                            print(f'参数更新阶段 | step {global_step:,} | {fine.phase} | 可训练参数 '
                                   f'{fine.state(global_step)["trainable_parameters"]:,}', flush=True)
                             log_json(args.output / 'events.jsonl', dict(event='finetuning_phase',
                                 step=global_step, **fine.state(global_step)), console=False)
@@ -471,6 +488,9 @@ def main():
                 if batch_index + 1 < steps * accumulation and (phase_end or (every and global_step % every == 0)):
                     assess(epoch, batch_index, False, 'phase_boundary' if phase_end else 'steps')
                     step_validated = True
+                    if early_stop_requested:
+                        stop = True
+                        break
                 save_steps = resolved['checkpoint']['save_every_steps']
                 if (resolved['checkpoint']['save_last'] and save_steps and global_step % save_steps == 0
                         and batch_index + 1 < steps * accumulation and not step_validated):
@@ -508,7 +528,7 @@ def main():
         if world > 1:
             dist.barrier()
         batch_start = 0
-        if stop or (cap and global_step >= cap):
+        if stop or early_stop_requested or (cap and global_step >= cap):
             break
     if rank == 0:
         print(f"训练结束 | 总更新 {global_step:,}/{total:,} | 用时 {time.monotonic() - started:.1f}s | 输出 {args.output}", flush=True)
@@ -516,8 +536,6 @@ def main():
             print('导出本次最佳模型供推理使用：\n' + shlex.join([
                 sys.executable, str(Path(__file__).with_name('export.py')),
                 '--checkpoint', str(args.output / 'best.pt'), '--output', 'weights']), flush=True)
-    if dist.is_initialized():
-        dist.destroy_process_group()
     if run_log:
         run_log.close()
 

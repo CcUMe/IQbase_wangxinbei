@@ -43,12 +43,18 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
     ]
     if device.type == 'cuda':
         lines.append(f"可见 GPU   : {os.environ.get('CUDA_VISIBLE_DEVICES', '(未显式设置)')}")
+    hierarchy = model.get('hierarchy', {})
+    hybrid = model.get('hybrid', {}).get('enabled', False)
+    model_line = (f"模型       : 分阶段共享编码 | widths={hierarchy['stage_widths']}"
+                  f" depths={hierarchy['stage_depths']} | 高效加性注意力 | 参数头={model['heads']['parameter_mode']}"
+                  if hierarchy.get('enabled') and not hybrid else
+                  f"模型       : width={model['encoder']['width']} depth={model['encoder']['depth']} heads={model['encoder']['heads']}"
+                  f" | patch={model['signal']['patch_size']} | 参数头={model['heads']['parameter_mode']}"
+                  f" | QK norm={model['encoder']['qk_normalization']} | fusion norm={model['signal']['normalize_fusion']}")
     lines.extend([
         f"数据       : 训练 {train_rows:,} 条 | 验证 {val_rows:,} 条 | 采样 {data['sampling']['mode']}",
         '原始任务数 : ' + ' | '.join(f'{name}={count:,}' for name, count in info['task_counts']['train'].items()),
-        f"模型       : width={model['encoder']['width']} depth={model['encoder']['depth']} heads={model['encoder']['heads']}"
-        f" | patch={model['signal']['patch_size']} | 参数头={model['heads']['parameter_mode']}"
-        f" | QK norm={model['encoder']['qk_normalization']} | fusion norm={model['signal']['normalize_fusion']}",
+        model_line,
         f"模型参数   : 最终 {report['final_parameters'] / 1e6:.3f}M | 共享 {report['shared_ratio']:.2%}"
         f" | 训练辅助参数 {report['auxiliary_parameters'] / 1e6:.3f}M",
         f"表征结构   : pooling={model['heads']['classification_pooling']}"
@@ -67,6 +73,54 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
         f"学习率     : {settings['scheduler']['name']} | 预热 {warmup:,} steps"
         f" | 最低比例 {settings['scheduler']['min_lr_ratio']:g}",
     ])
+    pyramid = model.get('pyramid', {})
+    if hybrid and model['hybrid']['topology'] == 'serial':
+        mechanism = hierarchy['mechanism']
+        a, b = hierarchy['downsample_strides']
+        strides = [model['signal']['patch_size'], a * b, 1]
+        lines.append('统一基座   : 一次时频提取/融合 → BiLSTM → 阶段编码 → token投影 → 原Transformer核心')
+        lines.append(f"前半段     : widths={hierarchy['stage_widths']} depths={hierarchy['stage_depths']}"
+                     f" | BiLSTM {hierarchy['lstm_layers']}层 hidden={hierarchy['lstm_hidden']} / {hierarchy['lstm_precision']}")
+        lines.append(f"投影衔接   : 阶段累计stride={a * b} → adapter_stride={model['signal']['patch_size'] // (a * b)}"
+                     f" → Transformer累计stride={model['signal']['patch_size']}")
+        lines.append('跨层Token  : ' + ' | '.join(f'L={length}: {"/".join(str(length // stride) for stride in strides)}'
+                                                  for length in [512, 1024]) + '（Transformer末层/阶段末层/阶段首层）')
+        lines.append(f"频谱对齐   : I窗{hierarchy['spectrum']['i_window']} / 复IQ窗{hierarchy['spectrum']['iq_window']}"
+                     + ('，对称居中；全局谱后移至跨层读出' if mechanism['enabled'] else '，对称居中；全局谱并入同一前端')
+                     + ' | 三任务共享完整主干')
+        if mechanism['enabled']:
+            lines.append(f"机制分工   : BiLSTM局部窗={mechanism['recurrent_window']}原样点"
+                         f" | 阶段注意力窗={mechanism['attention_window']} tokens | 全局关系由Transformer建模")
+            lines.append('信号保留   : 原归一化I/Q、log功率/变化、差分相位实虚分量；绕过逐token归一化进入任务读出')
+            lines.append(f"调制读出   : 深层描述＋有界细节修正 | 初始={mechanism['detail_initial_ratio']:g}"
+                         f" 上限={mechanism['detail_max_ratio']:g}（逐维幅度，非logit比例）")
+    elif hybrid:
+        a, b = hierarchy['downsample_strides']
+        strides = [model['signal']['patch_size'], a * b, 1]
+        lines.append(f"组合基座   : 保留原P{model['signal']['patch_size']} Transformer主干；共享细节支路"
+                     f" widths={hierarchy['stage_widths']} depths={hierarchy['stage_depths']}")
+        lines.append(f"连续时序   : 支路融合后 {hierarchy['lstm_layers']} 层BiLSTM"
+                     f" | 每方向hidden={hierarchy['lstm_hidden']} | {hierarchy['lstm_precision']}")
+        lines.append('融合Token  : ' + ' | '.join(f'L={length}: {"/".join(str(length // stride) for stride in strides)}'
+                                                  for length in [512, 1024]) + '（原主干/支路上下文/支路细节）')
+        lines.append('任务读出   : 同一共享基座统一融合 | 单个调制分类器 / 协议头 / 七参数查询头')
+    elif hierarchy.get('enabled'):
+        a, b = hierarchy['downsample_strides']
+        strides = [1, a, a * b]
+        lines.append(f"连续时序   : 融合后 {hierarchy['lstm_layers']} 层BiLSTM | 每方向hidden={hierarchy['lstm_hidden']}"
+                     f" | recurrent_precision={hierarchy['lstm_precision']} | 首次下采样前保留完整有效长度")
+        lines.append('有效Token  : ' + ' | '.join(f'L={length}: {"/".join(str(length // stride) for stride in strides)}'
+                                                  for length in [512, 1024]) + '（高/中/低分辨率）')
+        lines.append('频谱视图   : I-STFT实部＋虚部 / 完整复I/Q局部log功率谱 | hop=1 | 全局谱='
+                     + str(model['signal']['global_spectrum']))
+        lines.append('任务读出   : 三阶段特征＋跨尺度摘要 | 一个23类调制头 / 8类协议头 / 七查询＋七独立参数MLP')
+    elif pyramid.get('enabled'):
+        strides = [model['signal']['patch_size'], pyramid['mid']['stride'], pyramid['fine']['stride']]
+        lines.append(f"多尺度基座 : 复数stem={pyramid['stem_complex_channels']}复通道"
+                     f" | 分支width={pyramid['width']} | local={pyramid['local_blocks']} / Transformer={pyramid['transformer_depth']}")
+        lines.append('有效Token  : ' + ' | '.join(f'L={length}: {"/".join(str(length // stride) for stride in strides)}'
+                                                  for length in [512, 1024]) + '（主干/中/细）')
+        lines.append('任务读出   : 调制=三尺度注意力统计 | 协议=融合摘要 | 参数=七查询＋七独立MLP | 单模型共享权重')
     if training['stage'] == 'pretrain':
         pretrain = settings['loss']['pretraining']
         weights = pretrain['weights']
@@ -78,9 +132,12 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
     else:
         loss = settings['loss']['supervised']
         fine = settings['finetuning']
-        lines.append(f"微调策略   : {fine['strategy']} | 任务头预热 {fine['head_warmup_steps']} steps"
-                     f" | 上层适配 {fine['upper_layers_steps']} steps | 最后 {fine['unfreeze_last_n_blocks']} blocks"
-                     f" | 层间LR倍率 {fine['layer_lr_decay']:g} | anchor_weight={fine['anchor_weight']:g}")
+        if not (args.init_checkpoint or args.warmstart_checkpoint or args.resume) and fine['strategy'] == 'full':
+            lines.append('监督策略   : 随机初始化，全参从第一步更新，无冻结或任务头单独训练阶段')
+        else:
+            lines.append(f"微调策略   : {fine['strategy']} | 任务头预热 {fine['head_warmup_steps']} steps"
+                         f" | 上层适配 {fine['upper_layers_steps']} steps | 最后 {fine['unfreeze_last_n_blocks']} blocks"
+                         f" | 层间LR倍率 {fine['layer_lr_decay']:g} | anchor_weight={fine['anchor_weight']:g}")
         lines.append(f"监督目标   : task_weights={loss['task_weights']} | 回归={loss['regression']} | grid_weight={loss['grid_weight']:g}")
         lines.append(f"训练增强   : 随机整窗相位旋转概率={data['augmentation']['phase_rotation_probability']:g}"
                      f" | label_smoothing={loss['label_smoothing']:g} | 验证/推理不增强")
@@ -90,6 +147,7 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
             f"加载完整模型 {args.warmstart_checkpoint}" if args.warmstart_checkpoint else
             f"加载基座 {args.init_checkpoint}" if args.init_checkpoint else '随机初始化')
     evaluation = settings['evaluation']
+    early = evaluation.get('early_stopping', {'patience': 0, 'min_delta': 0.})
     lines.extend([
         f"初始化     : {mode}",
         f"检查点     : save_last={settings['checkpoint']['save_last']}"
@@ -98,6 +156,7 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
         f"验证       : 每 {evaluation['every_epochs']} epochs | batch={evaluation['batch_size']}"
         f" | {'全量' if not evaluation['max_batches'] else str(evaluation['max_batches']) + ' batches'}"
         f" | selection={evaluation['selection_metric']}",
+        f"提前停止   : patience={early['patience']} 次完整验证（0=关闭） | 最小改善={early['min_delta']:g}",
         f"配置       : {args.config}",
         f"数据目录   : {args.data}",
         f"输出目录   : {args.output}",

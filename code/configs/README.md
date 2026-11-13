@@ -1,5 +1,8 @@
 # 配置目录与参数说明
 
+2026-11-12更新：supervised/main.json5使用单前端串行统一基座，并启用hierarchy.mechanism：局部上下文、六值幅相保留、全局谱后移、深层主导调制读出。19.17M参数、共享91.01%。[当前运行指南](../../docs/supervised_multiresolution.md)、[机理说明](../../docs/signal_mechanism_optimization.md)。
+保留的 17:18 历史版本：[`supervised/pyramid_v1_171823.json5`](supervised/pyramid_v1_171823.json5)，原 Transformer＋中／细尺度分支，20.97M 参数；[训练、续训及源码快照说明](../../docs/pyramid_v1_171823.md)。新训练输出到 `logs/supervised_pyramid_v1/`，与当前 main 分开。
+
 配置按用途分目录，每个实验是一份完整JSON，可以直接运行；不使用配置继承、隐式合并或软链接。同一实验的模型、数据、损失、训练预算和GPU设置都在自己的文件中。
 
 各JSON已就地添加中文`//`注释，说明参数作用、可选值、0或空字符串的含义、阶段限制及配套修改关系。它们采用项目支持的带注释JSON语法（JSONC），应通过`load_config`或`read_config_json`读取；Python原生`json.load`不能直接读取注释。训练实际保存的resolved_config.json、工具生成的词表元数据及推理结果仍为标准JSON。
@@ -22,7 +25,8 @@ configs/
     round2_continue.json            # 适配第二轮继承方案
     round2_scratch.json             # 适配第二轮随机初始化方案
   supervised/
-    main.json                       # 当前日常监督入口
+    main.json5                      # 当前单前端串行基座
+    pyramid_v1_171823.json5          # 17:18历史Transformer＋中/细尺度版本
     small.json                      # 小模型连续回归对照
     comparisons/
       small_reference.json          # 384×8参考配置
@@ -38,7 +42,7 @@ configs/
     pretrain.json                   # 微型混合预训练流程检查
 ```
 
-当前预训练和微调配置为768宽、12层、6头；supervised/main.json保留用户当前的384宽、8层、6头及统计读出。它们不是同一尺寸，不能直接互载基座。comparisons保存原对照配方，不代表这些模板在当前修改后与历史运行完全相同；历史复现以运行目录中的resolved_config.json为准。
+预训练/微调配置保持原架构；当前监督入口将一套共享前端、阶段编码和Transformer核心串接。旧完整pt不能直接resume，新模型从零监督；原Transformer核心保留key和shape，迁移效果仍未验证。
 
 ## 短命令启动
 
@@ -47,7 +51,7 @@ configs/
 ```bash
 python code/training/build_codebook.py --config code/configs/codebook/round1.json
 python code/training/train.py --config code/configs/pretrain/round1.json
-python code/training/train.py --config code/configs/finetune/round1.json
+python code/training/train.py --config code/configs/finetune/round1.json5
 ```
 
 已有第一轮模型，做第二轮继承方案：
@@ -55,14 +59,14 @@ python code/training/train.py --config code/configs/finetune/round1.json
 ```bash
 python code/training/build_codebook.py --config code/configs/codebook/round2.json
 python code/training/train.py --config code/configs/pretrain/round2_continue.json
-python code/training/train.py --config code/configs/finetune/round2_continue.json
+python code/training/train.py --config code/configs/finetune/round2_continue.json5
 ```
 
 第二轮随机初始化对照复用同一份第二轮词表，不必再次构词：
 
 ```bash
 python code/training/train.py --config code/configs/pretrain/round2_scratch.json
-python code/training/train.py --config code/configs/finetune/round2_scratch.json
+python code/training/train.py --config code/configs/finetune/round2_scratch.json5
 ```
 
 已有完整词表可跳过构词步骤；构词入口要求输出目录为空，防止覆盖旧标签。第二轮教师和第二轮继承配置均固定到当前第一轮运行的同一份best.pt；若换第一轮运行，这两个来源应配套修改。若第一轮仍在训练，等待其结束或复制固定检查点，避免best.pt被更新。
@@ -75,12 +79,12 @@ python code/training/train.py --config code/configs/finetune/round2_scratch.json
 | 第二轮继承 | artifacts/structure_research_01/codebook_v2 | logs/pretrain_v2 / logs/finetune_v2 | 第一轮基座，结构头重置 |
 | 第二轮随机初始化 | 同一份codebook_v2 | logs/pretrain_v2_scratch / logs/finetune_v2_scratch | 全模型随机初始化 |
 
-三个预训练配置的数值配方由整理时的当前配置复制；不声称还原历史第一轮预算。第二轮两种初始化方案保持相同模型、损失、学习率计划、预算和GPU安排，便于起步比较，最终仍需考虑各自适合的学习率。微调三份配置的配方相同，只区分来源和输出。
+三个预训练配置的数值配方由整理时的当前配置复制；不声称还原历史第一轮预算。第二轮两种初始化方案保持相同模型、损失、学习率计划、预算和GPU安排，便于起步比较，最终仍需考虑各自适合的学习率。微调三份配置共用full全参策略：头部3e-4、基座3e-5、3%预热后cosine至5%、20轮。微调入口统一单卡、累积1次，有效batch256。best.pt按调制准确率选取。
 
 日常监督训练：
 
 ```bash
-python code/training/train.py --config code/configs/supervised/main.json
+python code/training/train.py --config code/configs/supervised/main.json5
 ```
 
 评估、导出、推理：
@@ -100,6 +104,8 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 训练和推理的runtime.gpus与runtime.processes配套修改：单卡为"2"和1，双卡为"2,3"和2；双卡还支持0/1、4/5。入口自动启动torchrun。构词表与独立评估保持单进程，在runtime.gpus选择一张卡，导出在CPU执行。整理没有更改现有GPU选择。
 
 训练有效batch为data.batch_size × processes × gradient_accumulation_steps；推理batching.batch_size为读取后再分片的记录数。更多说明见[单双卡检查说明](../../docs/device_compatibility.md)。
+
+手动停止按一次Ctrl+C后等待整组退出。中断不会临时保存额外检查点，应从最近完整的last.pt恢复。训练/推理入口已增加异常清理、启动器死亡保护及退出超时兜底，详见[停止说明](../../docs/device_compatibility.md#手动停止与异常退出)。
 
 ## 断点续训：checkpoint
 
@@ -121,7 +127,7 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 
 每份训练配置独立保存全部参数，读取支持//与/* */注释；未知字段和明显不一致的设置会报错。实际运行会在时间戳目录保存resolved_config.json。若复制配置开展新实验，应同步修改experiment.name和run.output。
 
-以下保留各参数的详细解释。默认weights/来自既有95M监督模型及统计读出，与用户当前384宽的supervised/main.json不能直接互载；既有64.50%结果不代表新配置从头训练可复现。
+以下保留参数详解；当前入口使用hierarchy控制统一主干前半段、encoder控制Transformer核心、hybrid.topology=serial选单前端串行结构。旧pyramid和并行模式不启用。
 
 ## 模型：`model`
 
@@ -138,7 +144,7 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 | `loss.supervised.contrastive.temperature` | `0.1` | 对比 softmax 温度，必须大于 0；减小会强化困难负样本 |
 | `loss.supervised.contrastive.gather_distributed` | `true` | 使用可反传的跨卡正/负样本；排除重复采到同一记录，按全局有效锚点数归一化 |
 
-缺省设置保持旧模型语义：均值池化，物理统计、FP32 分类头和局部残差前端均关闭；当前 `supervised/main.json` 显式启用本轮有效的统计读出。增补特征时全模型热启动会为新增输入列补零，保持初始化预测；更换宽度/层数或删减已有特征不支持静默载入。
+缺省设置保持旧模型语义：均值池化，物理统计、FP32 分类头和局部残差前端均关闭；当前`supervised/main.json5`启用新的多分辨率读出，支持范围见监督模型指南。旧架构的增补统计特征热启动可为新增输入列补零；这不适用于新旧多分辨率架构之间的权重迁移。
 
 三项假设诊断新增了同属 `model.signal` 的研究开关，当前主配置无需改动：`scale_embedding=true` 保留原始 RMS 尺度回注；`global_spectrum_input=true` 保留全局频谱回注；`multiscale_frontend=false` 关闭 Patch 前 dilation=1/4/16 并行残差。前两个开关置 false 时保留模块及共同初始化，只将该路径贡献置零；`global_spectrum=false` 则直接不建立全局模块，两者含义不同。本轮匹配预算下，去尺度、去全局回注和多尺度前端均未提高调制识别，不推荐直接启用这些改动。详细指标见 [假设验证报告](../../artifacts/hypothesis_validation/20261111_155810_763553/report.md)。
 
@@ -204,7 +210,7 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 }
 ```
 
-`learning_rate` 是任务头峰值学习率；基座峰值乘 `backbone_lr_factor`。是否对偏置和所有一维参数免除权重衰减可独立设置。默认保留原行为 false，便于与已有实验比较。
+`learning_rate`是任务头峰值学习率；基座峰值乘`backbone_lr_factor`。是否对偏置和所有一维参数免除权重衰减可独立设置；新监督main启用免衰减，通用默认保留原行为false以兼容历史配方。
 
 `optimizer.skip_inactive_heads` 保护本次参数更新中没有有效训练目标的任务头，随附配置均开启，生产训练入口要求为true。为完成DDP的零梯度连接会使AdamW误认为该头仍参与训练，继续施加历史动量与衰减；保护开启后，在同步反向传播后将这些参数的grad恢复为None。梯度累积取所有微批次的活动并集，DDP再跨rank取并集，避免各卡参数分歧。共享基座继续参与优化。
 
@@ -260,6 +266,8 @@ cosine 按**优化器更新**调度：先线性预热，再余弦下降。在完
 
 `train.log` 是终端总览、定期进度、逐类验证表和收尾信息的可读文本，去掉进度条的回车重绘；事件保存在 `events.jsonl`。恢复历史运行时，如果原 `train.log` 是 JSON 行，将原样保留到 `train_legacy.jsonl`，重名时递增后缀，再建立新的可读日志。历史指标和记录不会删除。
 
+`evaluation.early_stopping`按selection_metric判断，patience=0关闭；开启时要求全量验证。min_delta使用指标的绝对单位，Accuracy下0.001代表0.1个百分点。早停计数随checkpoint恢复，不影响任何微小新高的best保存；新main默认patience=8。
+
 ## 数据准备、词表与推理参数
 
 ```bash
@@ -288,8 +296,8 @@ python code/infer.py --config code/configs/deployment/inference.json
 | codebook.json | [codebook/round2.json](codebook/round2.json) |
 | pretrain_structure.json | [pretrain/round2_continue.json](pretrain/round2_continue.json) |
 | pretrain_reconstruction.json | [pretrain/reconstruction.json](pretrain/reconstruction.json) |
-| finetune.json | [finetune/round1.json](finetune/round1.json) |
-| main.json | [supervised/main.json](supervised/main.json) |
+| finetune.json | [finetune/round1.json5](finetune/round1.json5) |
+| main.json5 | [supervised/main.json5](supervised/main.json5) |
 | small.json | [supervised/small.json](supervised/small.json) |
 | main_small_reference.json | [supervised/comparisons/small_reference.json](supervised/comparisons/small_reference.json) |
 | main_large_30e.json | [supervised/comparisons/large_30e.json](supervised/comparisons/large_30e.json) |

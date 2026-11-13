@@ -40,21 +40,29 @@ class CommandConfigTests(unittest.TestCase):
 
     def test_auto_ddp_uses_current_python_and_does_not_recurse(self):
         with patch.dict(os.environ,{},clear=True), patch.object(sys,'argv',['train.py','--config','config.json']), \
-             patch('utils.command_config.subprocess.run') as run:
-            run.return_value.returncode=0
+             patch('utils.command_config.os.execvpe', side_effect=SystemExit(0)) as run:
             with self.assertRaises(SystemExit) as exc:
                 configured_launch('2,3',2,distributed=True)
             self.assertEqual(exc.exception.code,0)
-            self.assertEqual(run.call_args.args[0][:3],[sys.executable,'-m','torch.distributed.run'])
-            self.assertEqual(run.call_args.kwargs['env']['CUDA_VISIBLE_DEVICES'],'2,3')
+            self.assertEqual(run.call_args.args[0],sys.executable)
+            self.assertEqual(run.call_args.args[1][:3],[sys.executable,'-m','torch.distributed.run'])
+            self.assertEqual(run.call_args.args[2]['CUDA_VISIBLE_DEVICES'],'2,3')
+            self.assertEqual(run.call_args.args[2]['TORCH_ELASTIC_SHUTDOWN_TIMEOUT'],'10')
         with patch.dict(os.environ,{'LOCAL_RANK':'0','WORLD_SIZE':'2','CUDA_VISIBLE_DEVICES':'0,1'}), \
-             patch('utils.command_config.subprocess.run') as run:
+             patch('utils.command_config.os.execvpe') as run:
             configured_launch('2,3',2,distributed=True)
             run.assert_not_called()
             self.assertEqual(os.environ['CUDA_VISIBLE_DEVICES'],'0,1')
 
+    def test_launch_preserves_explicit_shutdown_timeout(self):
+        with patch.dict(os.environ, {'TORCH_ELASTIC_SHUTDOWN_TIMEOUT': '7'}, clear=True), \
+             patch('utils.command_config.os.execvpe', side_effect=SystemExit(0)) as launch:
+            with self.assertRaises(SystemExit):
+                configured_launch('2,3', 2, distributed=True)
+            self.assertEqual(launch.call_args.args[2]['TORCH_ELASTIC_SHUTDOWN_TIMEOUT'], '7')
+
     def test_invalid_pair_is_rejected_before_process_launch(self):
-        with patch.dict(os.environ,{},clear=True),patch('utils.command_config.subprocess.run') as run:
+        with patch.dict(os.environ,{},clear=True),patch('utils.command_config.os.execvpe') as run:
             with self.assertRaisesRegex(ValueError,'Two-GPU'):
                 configured_launch('2,4',2,distributed=True)
             with self.assertRaisesRegex(ValueError,'one process'):

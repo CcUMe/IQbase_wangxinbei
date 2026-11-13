@@ -7,6 +7,7 @@ PREFIXES = ['heads.modulation.', 'heads.protocol.', 'heads.queries.', 'heads.reg
             'grids.0.', 'grids.1.', 'grids.2.', 'grids.6.',
             'aux.reconstruction.', 'aux.atomic.', 'aux.emergent.']
 PREFIXES.append('aux.contrastive.')
+PREFIXES.extend(f'heads.regression.{j}.' for j in range(7))
 
 
 def active_heads(batch, config):
@@ -26,7 +27,12 @@ def active_heads(batch, config):
     valid = batch['target_valid']
     weights = torch.as_tensor(config['parameter_weights'])
     if config['task_weights'][2] and bool((valid & (weights > 0)).any()):
-        active.update(['heads.queries.', 'heads.regression.'])
+        active.add('heads.queries.')
+        if (config['model'].get('pyramid', {}).get('enabled', False)
+                or config['model'].get('hierarchy', {}).get('enabled', False)):
+            active.update(f'heads.regression.{j}.' for j in range(7) if weights[j] > 0 and bool(valid[:, j].any()))
+        else:
+            active.add('heads.regression.')
     for j in ([0, 1, 2, 6] if config['model']['parameter_mode'] == 'grid_residual' else []):
         if bool(valid[:, j].any()) and (config['grid_loss_weight'] or config['task_weights'][2] * weights[j]):
             active.update(['heads.queries.', f'grids.{j}.'])

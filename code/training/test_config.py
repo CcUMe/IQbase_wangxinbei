@@ -21,7 +21,8 @@ class ConfigurationTests(unittest.TestCase):
 
     def test_all_shipped_experiments_resolve(self):
         root = Path(__file__).resolve().parents[1] / 'configs'
-        paths = [path for path in sorted(root.rglob('*.json'))
+        paths = [path for path in sorted(root.rglob('*'))
+                 if path.suffix in {'.json', '.json5'}
                  if read_config_json(path).get('schema_version') == 2]
         self.assertTrue(paths, 'No training configurations discovered')
         for path in paths:
@@ -29,7 +30,10 @@ class ConfigurationTests(unittest.TestCase):
                 config = load_config(path)
                 options = training_options(config)
                 self.assertEqual(options['batch_size'], config['data']['batch_size'])
-                self.assertEqual(options['model']['width'], config['model']['encoder']['width'])
+                expected_width = (config['model']['hierarchy']['stage_widths'][-1]
+                                  if config['model']['hierarchy']['enabled'] and not config['model']['hybrid']['enabled']
+                                  else config['model']['encoder']['width'])
+                self.assertEqual(options['model']['width'], expected_width)
                 self.assertEqual(config['scheduler']['name'], 'cosine')
 
     def test_comments_preserve_slashes_and_escaped_quotes_inside_strings(self):
