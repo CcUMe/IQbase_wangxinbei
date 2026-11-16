@@ -1,0 +1,40 @@
+// 单卡串行：原始I/Q词表预训练 → 当前新模型构词 → 第二轮预训练 → 微调 → 导出。
+// 阶段模型/输入定义沿用三阶段正式配置，运行时冻结代码与全部实际配置。
+{
+  "configs": {
+    "pretrain": "code/configs/pretrain/shared_base.json5",
+    "finetune": "code/configs/finetune/shared_base.json5"
+  },
+  "run": {
+    "output": "logs/shared_base_iterative"
+  },
+  "round1": {
+    "epochs": 30,
+    "codebook": "artifacts/structure_research_01/codebook_v1"
+  },
+  // 继承第一轮best的整个backbone；结构头、优化器、调度器重新初始化。
+  // 总预训练预算30+50=80轮；骨干峰值1e-4，新结构头峰值3e-4。
+  "round2": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "backbone_lr_factor": 0.3333333333333333
+  },
+  // 仅训练集拟合聚类中心和BPE；全数据使用固定词表赋标签。
+  // 输出、教师路径由流程绑定，不能误读历史模型；失败的构词目录保留。
+  "codebook": {
+    "atomic_vocab": 512,
+    "max_patches": 200000,
+    "cluster_iterations": 20,
+    "cluster_chunk_size": 4096,
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "batch_size": 128,
+    "seed": 20261115,
+    "threads": 4
+  },
+  "runtime": {
+    "gpu": "0",
+    "device": "auto"
+  }
+}

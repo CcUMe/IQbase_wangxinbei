@@ -74,6 +74,44 @@ class StabilityTests(unittest.TestCase):
         torch.testing.assert_close(output[0].square().sum(), iq[0].square().sum())
         self.assertFalse(torch.equal(output[0], iq[0]))
 
+    def test_class_filtered_modulation_transform_preserves_other_records_and_padding(self):
+        torch.manual_seed(56)
+        iq=torch.randn(5,1024,2);iq[0,512:]=0
+        batch={'iq':iq,'lengths':torch.tensor([512,1024,1024,1024,1024]),
+               'modulation':torch.tensor([0,13,14,1,1]),'protocol':torch.tensor([-1,-1,-1,0,-1]),
+               'target_valid':torch.tensor([[False]*7]*4+[[True]*7])}
+        settings={'phase_rotation_probability':0.,'modulation_only':{
+            'phase_rotation_probability':1.,'circular_shift_probability':1.,'class_indices':list(range(14))}}
+        output=augment_supervised_iq(batch,settings)
+        torch.testing.assert_close(output[2:],iq[2:],rtol=0,atol=0)
+        torch.testing.assert_close(output[0,512:],torch.zeros_like(output[0,512:]),rtol=0,atol=0)
+        torch.testing.assert_close(output[:2].square().sum((1,2)),iq[:2].square().sum((1,2)))
+        self.assertFalse(torch.equal(output[:2],iq[:2]))
+
+    def test_joint_native_mix_selects_complete_views_without_global_rng_changes(self):
+        from training.optimize_density import augment_modulation
+        torch.manual_seed(66);iq=torch.randn(128,128,2);state=torch.get_rng_state().clone()
+        settings={'phase_probability':1.,'circular_shift_probability':1.}
+        transformed=augment_modulation(iq,settings,202611149)
+        default=augment_modulation(iq,{**settings,'apply_probability':1.},202611149)
+        torch.testing.assert_close(transformed,default,rtol=0,atol=0)
+        native=augment_modulation(iq,{**settings,'apply_probability':0.},202611149)
+        torch.testing.assert_close(native,iq,rtol=0,atol=0)
+        mixed=augment_modulation(iq,{**settings,'apply_probability':.5},202611149)
+        is_native=(mixed==iq).all((1,2));is_augmented=(mixed==transformed).all((1,2))
+        self.assertTrue(bool((is_native|is_augmented).all()))
+        self.assertGreater(int(is_native.sum()),30);self.assertLess(int(is_native.sum()),98)
+        torch.testing.assert_close(mixed.square().sum((1,2)),iq.square().sum((1,2)))
+        self.assertTrue(torch.equal(torch.get_rng_state(),state))
+
+    def test_generic_native_gate_zero_preserves_all_records(self):
+        iq=torch.randn(4,512,2)
+        batch={'iq':iq,'lengths':torch.full((4,),512),'modulation':torch.tensor([0,13,14,-1]),
+               'protocol':torch.tensor([-1,-1,-1,0]),'target_valid':torch.zeros(4,7,dtype=torch.bool)}
+        settings={'phase_rotation_probability':0.,'modulation_only':{
+            'phase_rotation_probability':1.,'circular_shift_probability':1.,'apply_probability':0.,'class_indices':list(range(14))}}
+        torch.testing.assert_close(augment_supervised_iq(batch,settings),iq,rtol=0,atol=0)
+
     def test_fusion_input_is_normalized_even_after_branch_scale_growth(self):
         _, _, model, _ = fixture()
         with torch.no_grad():

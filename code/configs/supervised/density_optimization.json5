@@ -1,0 +1,30 @@
+// Run with code/training/optimize_density.py. One shared foundation, one GPU.
+// Default: the verified 4800-step targeted-augmentation continuation.
+// training.arms selects methods; density parameters are used only for density arms.
+{
+  "run": {
+    "source": "artifacts/phase_generalization/20261114_large96/mod_sam_005_ema.pt",
+    "output": "logs/supervised_density",
+    "reliability": "artifacts/density_optimization/posterior_20261114/reliability.npz"
+  },
+  "model": {
+    "density_encoding": {"enabled": false, "width": 32, "codewords": 16,
+      "lags": [0, 4, 16], "shared_scale": 0.1}
+  },
+  "training": {
+    "arms": ["phase_shift_first14"],
+    "seed": 2026111418, "batch_size": 256,
+    "readout_preparation_steps": 1200, "joint_steps": 4800,
+    "precision": "bf16", "readout_gradient_clip": 5.0, "joint_gradient_clip": 1.0
+  },
+  "optimizer": {"readout_learning_rate": 0.0005, "original_learning_rate": 0.00003,
+    "new_learning_rate": 0.0003, "weight_decay": 0.01},
+  "scheduler": {"warmup_steps": 50, "minimum_ratio": 0.2},
+  "curriculum": {"minimum_relative_weight": 0.35, "joint_final_strength": 0.25},
+  "distillation": {"maximum_smoothing": 0.4, "ramp_steps": 100,
+    "first14_only": true},
+  "augmentation": {"phase_probability": 1.0, "circular_shift_probability": 1.0,
+    "apply_probability": 1.0},
+  "evaluation": {"batch_size": 128, "ema_decay": 0.995},
+  "logging": {"interval": 50, "tensorboard": true}
+}

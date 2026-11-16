@@ -8,9 +8,15 @@ from torch.nn import functional as F
 from utils.signal_statistics import signal_statistics, STATISTICS_DIM
 from utils.position import POSITION_DEFAULTS, position_coordinates
 from models.multiresolution import (READOUT_DEFAULTS, pyramid_options, validate_pyramid,
-    MultiResolutionPyramid, ModulationReadout, ProtocolReadout, ParameterQueries)
+    MultiResolutionPyramid, ModulationReadout, ProtocolReadout, ParameterQueries, temporal_readout_options,
+    mid_fusion_options)
 from models.hierarchical import hierarchy_options, validate_hierarchy, HierarchicalBackbone, SharedScaleFusion, HYBRID_DEFAULTS
 from models.signal_mechanisms import DeepAnchoredModulationReadout, fold_values
+from models.phase_relations import phase_relation_options
+from models.density_encoding import density_options,DensityEncoding,DensityClassifier
+from models.patch_shift import PatchShiftAdapter, patch_shift_options
+from models.iq_geometry import IQGeometry, iq_geometry_options
+from utils.normalization import observation_scale
 
 
 class RotaryAttention(nn.Module):
@@ -107,6 +113,15 @@ class Backbone(nn.Module):
         channels = 5 if config.get('phase_features', False) else 3
         self.time = TimeFrontend(channels, d, p, config.get('local_refinement', False),
                                  config.get('multiscale_frontend', False))
+        if config.get('iq_geometry', {}).get('enabled', False):
+            with torch.random.fork_rng(devices=[]):
+                self.iq_geometry = IQGeometry(d, p, config['iq_geometry'])
+        if config.get('patch_shift', {}).get('enabled', False):
+            with torch.random.fork_rng(devices=[]):
+                self.patch_shift = PatchShiftAdapter(d, p, config['patch_shift'])
+        if config.get('density_encoding',{}).get('enabled',False):
+            with torch.random.fork_rng(devices=[]):
+                self.time.density=DensityEncoding(d//2,config['density_encoding'])
         self.spectrum = nn.Sequential(nn.Conv1d(w, d // 2, 1), nn.GELU(), nn.Conv1d(d // 2, d, 3, padding=1))
         self.gate = nn.Linear(d * 2, d)
         self.freq_projection = nn.Linear(d, d)
@@ -134,13 +149,20 @@ class Backbone(nn.Module):
         visible = valid.clone()
         if patch_mask is not None:
             visible = visible & ~patch_mask.repeat_interleave(self.patch_size, 1)[:, :t]
-        masked = iq * visible[..., None]
-        scale = (masked.square().sum((1, 2)) / visible.sum(1).clamp_min(1)).sqrt().clamp_min(self.config['rms_epsilon'])
+        scale = observation_scale(iq,visible,self.config.get('normalization','rms'),
+                                  self.config.get('amplitude_percentile',99.),self.config['rms_epsilon'])
         target = iq / scale[:, None, None]
         x = target * visible[..., None]
         return x, target, scale, valid
 
     def forward(self, iq, lengths, patch_mask=None, sample_rates=None, return_context=False):
+        mid_fusion = getattr(getattr(self, 'pyramid', None), 'mid_fusion', None)
+        phase_adapter = getattr(getattr(self, 'pyramid', None), 'phase_relations', None)
+        if phase_adapter is not None and patch_mask is not None:
+            raise ValueError('phase_relations currently supports supervised encoding only')
+        if mid_fusion is not None and patch_mask is not None:
+            raise ValueError('Mid-scale fusion currently supports supervised encoding only')
+        use_context = return_context or mid_fusion is not None or phase_adapter is not None or hasattr(self.time,'density') or hasattr(self,'iq_geometry')
         x, target, scale, point_valid = self.preprocess(iq, lengths, patch_mask)
         b, t, _ = x.shape
         p = self.patch_size
@@ -155,14 +177,31 @@ class Backbone(nn.Module):
             reliability = (amplitude.squeeze(-1) * F.pad(amplitude[:, :-1, 0], (1, 0))).clamp_max(1)
             magnitude = (real.square() + imag.square()).sqrt().clamp_min(1e-6)
             features.append(torch.stack((real, imag), -1) / magnitude[..., None] * reliability[..., None])
-        if return_context:
+        if use_context:
             # Clear padding between convolutions. Otherwise a padded 512-point
             # record can differ from the same record evaluated at native length.
             inputs = torch.cat(features, -1) * point_valid[..., None]
             hidden = self.time[1](self.time[0](inputs.transpose(1, 2))) * point_valid[:, None]
+            if hasattr(self.time,'density'):
+                if hasattr(self.time,'refinement') or hasattr(self.time,'multiscale'):
+                    raise ValueError('Density encoding uses the original frontend without legacy refinement branches')
+                hidden=self.time.density(hidden,point_valid)
             time = self.time[2](hidden).transpose(1, 2) * valid[..., None]
         else:
-            time = self.time(torch.cat(features, -1).transpose(1, 2)).transpose(1, 2)
+            if hasattr(self, 'patch_shift'):
+                shift_hidden = self.time[1](self.time[0](torch.cat(features, -1).transpose(1, 2)))
+                time = self.time[2](shift_hidden).transpose(1, 2)
+            else:
+                time = self.time(torch.cat(features, -1).transpose(1, 2)).transpose(1, 2)
+        if hasattr(self, 'patch_shift'):
+            # Keep the original forward path intact, including historical padding
+            # semantics. Only the new local-offset residual masks hidden padding.
+            if use_context:
+                shift_hidden = hidden
+            time = time + self.patch_shift(shift_hidden, time, self.time[2], point_valid)
+        if hasattr(self, 'iq_geometry'):
+            visible = point_valid if patch_mask is None else point_valid & ~patch_mask.repeat_interleave(p,1)[:,:t]
+            time = time + self.iq_geometry(x, visible, self.time[0].weight, time, self.time[2].weight)
         # Real-valued fixed DFT convolution, centers exactly equal to time patches.
         with torch.autocast(device_type=x.device.type, enabled=False):
             transformed = F.conv1d(x.float().transpose(1, 2), self.stft_kernels.float(),
@@ -185,7 +224,7 @@ class Backbone(nn.Module):
                     global_power = re.square() + im.square()
                 global_power = torch.roll(global_power, 512, -1) / lengths[:, None]
                 global_power = torch.log1p(global_power)
-        if return_context:
+        if use_context:
             hidden = self.spectrum[1](self.spectrum[0](local * valid[:, None])) * valid[:, None]
             frequency = self.spectrum[2](hidden).transpose(1, 2) * valid[..., None]
         else:
@@ -212,12 +251,49 @@ class Backbone(nn.Module):
         h = h + self.position_projection(coordinates) * float(self.config['position_options']['absolute_features'])
         if self.config['normalize_fusion']:
             h = F.layer_norm(h, (h.shape[-1],)) * valid[..., None]
-        for block in self.blocks:
+        context = dict(iq=x, scale=scale, point_valid=point_valid, frequency=frequency)
+        if phase_adapter is not None:
+            updates = phase_adapter(x, point_valid, lengths)
+            h = (h + updates[0].to(h.dtype)) * valid[..., None]
+            context['phase_updates'] = updates
+        for number, block in enumerate(self.blocks, start=1):
             h = block(h, valid, positions)
+            if mid_fusion is not None and number == self.config['mid_fusion']['after_block']:
+                detail = self.pyramid.encode_details(context, valid, lengths)
+                coarse_centers = torch.arange(h.shape[1], device=h.device).float() * p + (p - 1) / 2
+                updated = mid_fusion([h, *detail['features']], [valid, *detail['valid']],
+                                     [coarse_centers, *detail['centers']], lengths)
+                h, detail['features'] = updated[0], updated[1:]
+                context['pyramid_details'] = detail
         encoded = self.norm(h) * valid[..., None]
         if return_context:
-            return encoded, valid, target, dict(iq=x, scale=scale, point_valid=point_valid, frequency=frequency)
+            return encoded, valid, target, context
         return encoded, valid, target
+
+
+class PatchBackbone(nn.Module):
+    """Plain shared IQ-patch Transformer for the paper-method reference branch."""
+    def __init__(self,config):
+        super().__init__();self.config=config;self.patch_size=config['patch_size']
+        d=config['width']
+        self.patch_projection=nn.Linear(self.patch_size*2,d)
+        self.mask_embedding=nn.Parameter(torch.zeros(d))
+        self.blocks=nn.ModuleList([Block(d,config['heads'],config['dropout'],config['mlp_ratio'],
+            config['attention_dropout'],config['rope_base'],config['qk_normalization'],config['qk_scale']) for _ in range(config['depth'])])
+        self.norm=nn.LayerNorm(d)
+
+    preprocess=Backbone.preprocess
+
+    def forward(self,iq,lengths,patch_mask=None,sample_rates=None):
+        x,target,_,_=self.preprocess(iq,lengths,patch_mask)
+        b,t,_=x.shape;p=self.patch_size;n=t//p
+        valid=torch.arange(n,device=x.device)[None]*p<lengths[:,None]
+        h=self.patch_projection(x.reshape(b,n,p*2))
+        h=h+self.mask_embedding*(0 if patch_mask is None else patch_mask[...,None])
+        positions,_=position_coordinates(lengths,n,p,self.config['heads'],self.config['position'],
+                                         self.config['position_options'],sample_rates)
+        for block in self.blocks:h=block(h,valid,positions)
+        return self.norm(h)*valid[...,None],valid,target
 
 
 class HybridBackbone(Backbone):
@@ -307,12 +383,21 @@ class RFModel(nn.Module):
                         parameter_query_temperature=1.0, qk_normalization=False, normalize_fusion=False, qk_scale=1.0,
                         contrastive_head=False, contrastive_projection_dim=128, classification_pooling='mean',
                         physical_statistics=False, local_refinement=False, classification_fp32=False,
-                        scale_embedding=True, global_spectrum_input=True, multiscale_frontend=False)
+                        scale_embedding=True, global_spectrum_input=True, multiscale_frontend=False,
+                        frontend='time_frequency',normalization='rms',amplitude_percentile=99.)
         self.config = {**defaults, **model_config}
         self.config['pyramid'] = pyramid_options(model_config.get('pyramid'))
         self.config['hierarchy'] = hierarchy_options(model_config.get('hierarchy'))
         self.config['hybrid'] = {**HYBRID_DEFAULTS, **model_config.get('hybrid', {})}
         self.config['multiscale_readout'] = {**READOUT_DEFAULTS, **model_config.get('multiscale_readout', {})}
+        self.config['modulation_temporal'] = temporal_readout_options(model_config.get('modulation_temporal'))
+        self.config['mid_fusion'] = mid_fusion_options(model_config.get('mid_fusion'), self.config['depth'])
+        self.config['phase_relations'] = phase_relation_options(model_config.get('phase_relations'))
+        self.config['density_encoding']=density_options(model_config.get('density_encoding'))
+        self.config['patch_shift'] = patch_shift_options(model_config.get('patch_shift'), self.config['patch_size'])
+        self.config['iq_geometry'] = iq_geometry_options(model_config.get('iq_geometry'), self.config['patch_size'])
+        if self.config['phase_relations']['enabled'] and not self.config['pyramid']['enabled']:
+            raise ValueError('phase_relations requires the pyramid backbone')
         self.hybrid = self.config['hybrid']['enabled']
         if self.config['hybrid']['topology'] not in ['parallel', 'serial']:
             raise ValueError('hybrid.topology must be parallel or serial')
@@ -330,6 +415,26 @@ class RFModel(nn.Module):
             self.config['width'] = self.config['hierarchy']['stage_widths'][-1]
             self.config['depth'] = sum(self.config['hierarchy']['stage_depths'])
         self.multiresolution = self.config['pyramid']['enabled'] or self.hierarchical or self.hybrid
+        if self.config['frontend'] not in ['time_frequency','linear_iq']:
+            raise ValueError('Unknown frontend')
+        if self.config['frontend']=='linear_iq' and (self.multiresolution or any(self.config[k]['enabled'] for k in ['iq_geometry','patch_shift','density_encoding','phase_relations']) or any(self.config[k] for k in ['phase_features','global_spectrum','scale_embedding','global_spectrum_input','local_refinement','multiscale_frontend']) or self.config['position_options'].get('absolute_features',True)):
+            raise ValueError('linear_iq requires only the shared IQ patch Transformer, without extra input adapters')
+        if self.config['iq_geometry']['enabled'] and (self.multiresolution or self.config['patch_shift']['enabled'] or
+                self.config['density_encoding']['enabled'] or any(self.config.get(k,False) for k in ['local_refinement','multiscale_frontend'])):
+            raise ValueError('iq_geometry uses the shared single-scale frontend; disable other experimental frontend adapters')
+        if self.config['patch_shift']['enabled'] and (self.multiresolution or any(
+                self.config.get(k, False) for k in ['local_refinement', 'multiscale_frontend']) or
+                self.config['density_encoding']['enabled']):
+            raise ValueError('patch_shift currently requires the original single-scale frontend without other adapters')
+        if self.config['density_encoding']['enabled'] and self.multiresolution:
+            raise ValueError('Initial density optimization uses the historical best single-scale foundation')
+        if self.config['mid_fusion']['enabled']:
+            if not self.config['pyramid']['enabled']:
+                raise ValueError('mid_fusion currently requires the pyramid backbone')
+            if model_config.get('position_options', {}).get('reference_length', 1024) != 1024:
+                raise ValueError('mid_fusion requires reference_length=1024 for consistent sample coordinates')
+        if self.config['modulation_temporal']['enabled'] and not self.config['pyramid']['enabled']:
+            raise ValueError('modulation_temporal currently requires the pyramid backbone')
         if self.multiresolution:
             if not self.hierarchical and not self.hybrid:
                 validate_pyramid(self.config['pyramid'], self.config['multiscale_readout'], self.config['patch_size'])
@@ -345,7 +450,8 @@ class RFModel(nn.Module):
         self.config['position_options'] = {**POSITION_DEFAULTS, **supplied}
         if 'reference_sample_rate' in model_config and 'reference_sample_rate_hz' not in supplied:
             self.config['position_options']['reference_sample_rate_hz'] = model_config['reference_sample_rate']
-        self.backbone = (UnifiedBackbone(self.config) if self.hybrid and self.config['hybrid']['topology'] == 'serial' else
+        self.backbone = (PatchBackbone(self.config) if self.config['frontend']=='linear_iq' else
+                         UnifiedBackbone(self.config) if self.hybrid and self.config['hybrid']['topology'] == 'serial' else
                          HybridBackbone(self.config) if self.hybrid else
                          HierarchicalBackbone(self.config) if self.hierarchical else Backbone(self.config))
         self.schema = schema
@@ -362,13 +468,15 @@ class RFModel(nn.Module):
                 attention_dropout = branch['dropout']
             else:
                 branch = self.config['pyramid']
-                self.backbone.pyramid = MultiResolutionPyramid(d, self.config['patch_size'], self.config['rope_base'], branch)
+                self.backbone.pyramid = MultiResolutionPyramid(d, self.config['patch_size'], self.config['rope_base'], branch,
+                                                               self.config['mid_fusion'], self.config['phase_relations'])
                 widths, memory_width, memory_heads = [d, branch['width'], branch['width']], branch['width'], branch['heads']
                 attention_dropout = branch['attention_dropout']
             self.heads = nn.ModuleDict({
                 'modulation': (DeepAnchoredModulationReadout(widths, len(schema['classification_labels']['modulation']), readout,
                                   self.config['hierarchy']['mechanism']) if self.preserve_signal else
-                               ModulationReadout(widths, len(schema['classification_labels']['modulation']), readout)),
+                               ModulationReadout(widths, len(schema['classification_labels']['modulation']), readout,
+                                                 self.config['modulation_temporal'])),
                 'protocol': ProtocolReadout(widths, len(schema['classification_labels']['protocol']), readout),
                 'queries': ParameterQueries(widths, memory_width, memory_heads, attention_dropout,
                     self.config['parameter_query_temperature'], carrier_dim=6 if self.preserve_signal else 0),
@@ -377,6 +485,9 @@ class RFModel(nn.Module):
             grid_width = memory_width * 2 + (6 if self.preserve_signal else 0)
         else:
             self._legacy_heads(d, schema)
+            if self.config['density_encoding']['enabled']:
+                with torch.random.fork_rng(devices=[]):
+                    self.heads['modulation']=DensityClassifier(self.heads['modulation'],self.backbone.time.density.output_dim)
             grid_width = d * 2
         # Timing fields stay continuous even when a smoke subset has few values.
         self.grid_indices = [j for j, values in enumerate(parameter_grids) if j in [0, 1, 2, 6] and 1 < len(values) <= 64]
@@ -439,7 +550,9 @@ class RFModel(nn.Module):
             classification_features = torch.cat((classification_features, signal_statistics(student_iq, lengths)), -1)
         context = torch.autocast(device_type=iq.device.type, enabled=False) if self.config['classification_fp32'] else nullcontext()
         with context:
-            output = {task: self.heads[task](classification_features) for task in ['modulation', 'protocol']}
+            output={'protocol':self.heads['protocol'](classification_features)}
+            output['modulation']=(self.heads['modulation'](classification_features,self.backbone.time.density.descriptor)
+                if self.config['density_encoding']['enabled'] else self.heads['modulation'](classification_features))
         if 'contrastive' in self.aux:
             output['contrastive_embedding'] = self.aux['contrastive'](classification_features)
         score = torch.einsum('bnd,jd->bjn', h, self.heads['queries'].weight) / (math.sqrt(h.shape[-1]) * self.config['parameter_query_temperature'])

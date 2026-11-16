@@ -1,5 +1,7 @@
 # 新串行／BiLSTM架构退步诊断
 
+> 后续处理：已按用户要求移除当前串行方案的main配置，日常入口改为 `code/configs/supervised/pyramid_v1_171823.json5`。下文记录移除前的诊断事实。
+
 2026-11-13，Asia/Shanghai。分析来自实际训练日志和已训练checkpoint；未运行新的GPU训练。主配置、训练源码和原checkpoint未修改。
 
 ## 明确结论

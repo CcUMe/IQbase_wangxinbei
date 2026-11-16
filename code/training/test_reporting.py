@@ -55,6 +55,20 @@ class ReportingTests(unittest.TestCase):
         single = list(MatchedSampler(dataset, 5, 3, 2026, 'modulation_only'))
         self.assertEqual(joint[::3], single)
 
+    def test_context_saves_exception_before_restoring_console(self):
+        with tempfile.TemporaryDirectory() as directory:
+            console = io.StringIO()
+            with patch('sys.stdout', console), patch('sys.stderr', console):
+                with self.assertRaisesRegex(ValueError, 'original failure'):
+                    with ReadableRunLog(directory):
+                        print('last training message')
+                        raise ValueError('original failure')
+                self.assertIs(sys.stdout, console)
+            text = (Path(directory) / 'train.log').read_text()
+            self.assertIn('last training message', text)
+            self.assertIn('ValueError: original failure', text)
+            self.assertNotIn('ValueError: original failure', console.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

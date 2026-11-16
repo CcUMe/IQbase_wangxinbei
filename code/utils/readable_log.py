@@ -3,6 +3,7 @@ import atexit
 import re
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 
@@ -88,5 +89,11 @@ class ReadableRunLog:
     def __enter__(self):
         return self
 
-    def __exit__(self, *_):
-        self.close()
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        try:
+            if exc_type is not None:
+                # The unhandled traceback reaches stderr after this context has
+                # closed; save it here once without printing twice to console.
+                traceback.print_exception(exc_type, exc_value, exc_traceback, file=self.file)
+        finally:
+            self.close()

@@ -1,0 +1,277 @@
+// P8正式入口：三阶段共用相同骨干；预训练随机连续遮蔽跨度8，最终比例30%。
+// 正式入口：code/training/train.py；与其他两阶段保持同一骨干。
+{
+  // 统一训练配置版本。
+  "schema_version": 2,
+
+  // 三个正式入口共用同一共享骨干。
+  "experiment": {
+    "name": "finetune_shared_base_p8",
+    "description": "finetune：统一768×12、P8共享时频基座；相位增强只用于监督阶段。"
+  },
+
+  // 从仓库根目录启动；输出自动追加时间戳。
+  "run": {
+    "data": "artifacts/data_full_p8",
+    "output": "logs/finetune_shared_base_p8",
+    "codebook": "",
+    "init_checkpoint": "logs/pretrain_shared_base_p8",
+    "warmstart_checkpoint": ""
+  },
+
+  // 三阶段的共享主干和输入语义一致；阶段预测头由训练入口生成。
+  "model": {
+    // 局部I/Q几何：复用原时域卷积核，零初始残差；三阶段均启用。
+    "iq_geometry": {"enabled": true, "bottleneck": 64, "lags": [1, 4], "max_scale": 0.1, "dropout": 0.0, "epsilon": 1e-06},
+    "encoder": {
+      "width": 768,
+      "depth": 12,
+      "heads": 6,
+      "mlp_ratio": 4.0,
+      "dropout": 0.1,
+      "attention_dropout": 0.1,
+      "rope_base": 10000.0,
+      "qk_normalization": true,
+      "qk_scale": 1.0
+    },
+    "signal": {
+      "patch_size": 8,
+      "stft_window": 64,
+      "phase_features": true,
+      "global_spectrum": true,
+      "spectral_backend": "fft",
+      "position": "samples",
+      "rms_epsilon": 1e-06,
+      "normalize_fusion": false,
+      "local_refinement": false,
+      "position_options": {
+        "reference_length": 1024,
+        "window_head_fraction": 0.5,
+        "absolute_features": true,
+        "sample_rate_hz": 0.0,
+        "reference_sample_rate_hz": 1.0
+      },
+      "scale_embedding": true,
+      "global_spectrum_input": true,
+      "multiscale_frontend": false
+    },
+    "heads": {
+      "parameter_mode": "grid_residual",
+      "classification_hidden_ratio": 0.5,
+      "grid_residual_scale": 0.1,
+      "parameter_query_temperature": 1.0,
+      "contrastive_projection_dim": 128,
+      "classification_pooling": "mean",
+      "physical_statistics": false,
+      "classification_fp32": false,
+      "multiscale_readout": {
+        "projection_width": 256,
+        "modulation_hidden": 256,
+        "protocol_hidden": 128,
+        "parameter_hidden": 128,
+        "dropout": 0.1,
+        "variance_epsilon": 1e-06
+      },
+      "modulation_temporal": {
+        "enabled": false,
+        "segments": 4,
+        "segment_width": 64,
+        "temporal_kernel": 3,
+        "dropout": 0.1,
+        "residual_scale": 0.1
+      }
+    }
+  },
+
+  // 单卡batch；监督/微调仅对前14类纯调制记录做相位增强。
+  "data": {
+    "batch_size": 256,
+    "steps_per_epoch": 0,
+    "merge_paired": false,
+    "augmentation": {
+      "phase_rotation_probability": 0.0,
+      "modulation_only": {
+        "phase_rotation_probability": 1.0,
+        "circular_shift_probability": 0.0,
+        "apply_probability": 1.0,
+        "class_indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13
+        ]
+      }
+    },
+    "sampling": {
+      "mode": "balanced",
+      "task_probabilities": {
+        "modulation": 1.0,
+        "protocol": 1.0,
+        "parameter": 1.0
+      }
+    },
+    "loader": {
+      "num_workers": 4,
+      "pin_memory": true,
+      "persistent_workers": false,
+      "prefetch_factor": 2
+    }
+  },
+
+  // max_steps仅是停止上限，不缩短完整cosine周期。
+  "training": {
+    "stage": "supervised",
+    "epochs": 20,
+    "max_steps": 0,
+    "gradient_accumulation_steps": 1,
+    "gradient_clip": 1.0
+  },
+
+  // 全参训练，不使用逐步解冻。
+  "finetuning": {
+    "strategy": "full",
+    "head_warmup_steps": 0,
+    "upper_layers_steps": 0,
+    "unfreeze_last_n_blocks": 4,
+    "layer_lr_decay": 1.0,
+    "frontend_lr_factor": 1.0,
+    "anchor_weight": 0.0,
+    "validation_every_steps": 0,
+    "validate_stage_boundaries": false
+  },
+
+  // 微调时基座LR小于随机任务头；有监督从头训练和预训练不缩小基座LR。
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0003,
+    "backbone_lr_factor": 0.1,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "exclude_bias_and_norm_from_decay": false,
+    "skip_inactive_heads": true
+  },
+
+  // 3%线性warmup后cosine。
+  "scheduler": {
+    "name": "cosine",
+    "warmup_steps": 0,
+    "warmup_ratio": 0.03,
+    "warmup_start_factor": 0.0,
+    "min_lr_ratio": 0.05
+  },
+
+  // 只启用stage对应目标；结构预训练的原始波形重建权重为0。
+  "loss": {
+    "supervised": {
+      "task_weights": {
+        "modulation": 1.0,
+        "protocol": 1.0,
+        "parameter": 1.0
+      },
+      "contrastive": {
+        "weight": 0.0,
+        "temperature": 0.1,
+        "gather_distributed": true
+      },
+      "label_smoothing": 0.0,
+      "regression": "mse",
+      "huber_delta": 1.0,
+      "parameter_weights": {
+        "symbol_rate": 1.0,
+        "bandwidth": 1.0,
+        "frequency_shift": 1.0,
+        "pulse_width": 1.0,
+        "pri": 1.0,
+        "time_delay": 1.0,
+        "number_of_pulses": 1.0
+      },
+      "grid_weight": 0.1
+    },
+    "pretraining": {
+      "mask": {
+        "ratio": 0.3,
+        "span": 8,
+        "strategy": "random",
+        "energy_fraction": 0.5,
+        "energy_floor": 0.05
+      },
+      "weights": {
+        "reconstruction": 0.0,
+        "atomic": 1.0,
+        "emergent": 1.0,
+        "spectrum": 0.0
+      },
+      "equalize_emergent_spans": false
+    }
+  },
+
+  // 原始输入完整验证；预训练评估结构预测损失。
+  "evaluation": {
+    "every_epochs": 1,
+    "batch_size": 128,
+    "max_batches": 0,
+    "precision": "fp32",
+    "mask_seed": 12345,
+    "selection_metric": "modulation_accuracy",
+    "early_stopping": {
+      "patience": 0,
+      "min_delta": 0.001
+    },
+    "proxy_task_weights": {
+      "modulation": 30.0,
+      "protocol": 30.0,
+      "parameter": 40.0
+    }
+  },
+
+  // 保存可恢复的last与选模best。
+  "checkpoint": {
+    "resume_from": "",
+    "save_last": true,
+    "save_best": true,
+    "save_best_modulation": true,
+    "save_best_proxy": false,
+    "save_every_steps": 1000,
+    "save_every_epochs": 0
+  },
+
+  // 单进程单GPU，BF16；正式流程脚本会覆盖物理GPU编号。
+  "runtime": {
+    "device": "auto",
+    "gpus": "0",
+    "processes": 1,
+    "precision": "bf16",
+    "seed": 20261115,
+    "threads": 4,
+    "log_every": 50,
+    "deterministic": false,
+    "allow_tf32": false,
+    "progress_bar": true,
+    "progress_min_interval": 0.5
+  },
+
+  // 可读日志、JSONL和TensorBoard。
+  "logging": {
+    "tensorboard": {
+      "enabled": true,
+      "log_every_steps": 0,
+      "flush_secs": 30,
+      "max_queue": 10,
+      "classwise_metrics": true
+    }
+  }
+}

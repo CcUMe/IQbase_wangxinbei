@@ -1,0 +1,51 @@
+// One unattended continuation from the verified 67.57% candidate.
+// Use code/training/train_shift_consistent.py, not the legacy train.py.
+{
+  "run": {
+    "source": "logs/supervised_density/20261114_164340_348077/phase_shift_first14/ema.pt",
+    "data": "artifacts/data_full",
+    "output": "logs/supervised_shift_consistent"
+  },
+  "model": {
+    "patch_shift": {
+      "enabled": true,
+      "stride": 4,
+      "bottleneck": 64,
+      "max_scale": 0.2,
+      "dropout": 0.05,
+      "variance_epsilon": 0.000001
+    }
+  },
+  "training": {
+    "steps": 24000,
+    "batch_size": 256,
+    "seed": 2026111427,
+    "precision": "bf16",
+    "gradient_clip": 1.0,
+    "ema_decay": 0.995
+  },
+  "optimizer": {
+    "learning_rate": 0.00002,
+    "adapter_learning_rate": 0.0002,
+    "weight_decay": 0.01
+  },
+  "scheduler": {"warmup_steps": 500, "minimum_ratio": 0.2},
+  "views": {
+    "class_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+    "phase_probability": 1.0,
+    "shift_probability": 1.0,
+    "augmented_weight": 0.5,
+    "consistency_weight": 0.05,
+    "ramp_steps": 2000
+  },
+  "evaluation": {
+    "every_steps": 2400,
+    "batch_size": 128,
+    "protocol_max_drop": 0.003,
+    "qam_max_drop": 0.005,
+    "macro_f1_max_drop": 0.003,
+    "parameter_max_rmse_increase": 0.05
+  },
+  "checkpoint": {"every_steps": 500},
+  "runtime": {"device": "cuda:0", "threads": 4, "log_every": 50, "tensorboard": true}
+}

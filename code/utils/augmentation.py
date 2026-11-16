@@ -30,6 +30,12 @@ def augment_supervised_iq(batch, settings):
     if not (phase or shift):
         return iq
     eligible = (batch['modulation'] >= 0) & (batch['protocol'] < 0) & ~batch['target_valid'].any(-1)
+    classes=options.get('class_indices',[])
+    if classes:
+        eligible=eligible & torch.isin(batch['modulation'],torch.as_tensor(classes,device=iq.device,dtype=batch['modulation'].dtype))
+    probability=options.get('apply_probability',1.)
+    if probability<1:
+        eligible=eligible & (torch.rand(len(iq),device=iq.device)<probability)
     if phase:
         selected = eligible & (torch.rand(len(iq), device=iq.device) < phase)
         angles = torch.rand(len(iq), device=iq.device) * (2 * math.pi) * selected

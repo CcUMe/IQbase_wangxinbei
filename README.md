@@ -1,8 +1,18 @@
 # C01 电磁感知模型：训练与推理代码
 
+2026-11-15新增统一P8候选：三阶段入口`code/configs/{supervised,pretrain,finetune}/shared_base_p8.json5`；默认GPU2,3双卡执行`bash code/training/run_iterative_pretrain_p8_dual.sh`。新P8原始词表预训练30轮→本轮教师构词→第二轮50轮→微调20轮→导出；预训练跨度8、比例30%，每卡128。P8缓存保留原波形、标签与划分，使用新指纹及新词表，不复用P16目标。P16全部历史产物保留。[P8准备、启动与恢复](docs/shared_base_p8_training.md)。该候选尚无正式精度结论。
+
+2026-11-15当前三阶段入口为`code/configs/{supervised,pretrain,finetune}/shared_base.json5`，统一使用同一95.909M共享时频主干与局部I/Q几何残差；相位增强只用于监督/微调。当前完整流程：`bash code/training/run_iterative_pretrain.sh`，默认单卡GPU0，原始I/Q第一轮词表预训练30轮→用本轮新模型重建词表→继承骨干进行第二轮预训练50轮→微调20轮→自动导出。预算和构词参数集中在`code/configs/pipeline/shared_base_iterative.json5`。流程冻结配置/源码，支持`--resume <流程目录>`，历史词表和训练记录保留。[三阶段配置与架构说明](docs/shared_base_training.md)。新结构的完整训练收益尚未确定。
+
+以下保留各历史实验的入口和结果；当前三阶段流程以以上配置和说明为准。
+
+双卡一键入口：`bash code/training/run_iterative_pretrain_dual.sh`，默认通信组0,1；可用`C01_GPUS=2,3`或`4,5`选择其他已分配空闲组。两轮预训练与微调用DDP，构词仅组内第一张卡；每卡128保持全局batch256。独立配置`code/configs/pipeline/shared_base_iterative_dual.json5`，输出`logs/shared_base_iterative_dual/<时间戳>/`。单卡入口保留；双卡入口不能直接resume单卡流程。[使用与恢复说明](docs/shared_base_training.md#双卡一键迭代入口)。
+
+2026-11-14新增单次长训练入口：`bash code/training/run_shift_consistent.sh`，默认GPU0后台运行，从67.57%候选热启动，加入共享Patch偏移适配器、原始/增强成对监督与一致性约束。支持严格断点恢复、EMA、三任务全量验证和自动导出历史最佳；尚未证明新增架构的正式精度收益。[配置与运行说明](docs/shift_consistent_training.md)。
+
 本项目实现一个共享时频双流基座，完成 23 类调制/波形识别、8 类体制识别和七项参数估计。包含分组数据划分、连续重建预训练、Atomic/Emergent 结构预训练、第二轮词表更新、多任务微调、评估、导出和统一推理。当前用于初步测试，未制作 Docker 镜像。
 
-2026-11-12：监督main.json5已启用单前端统一基座的机制优化：局部BiLSTM/窗口注意力、六值幅相保护、全局谱后移、深层主导调制读出及七参数信号值查询。总参数19.17M、共享91.01%，90项CPU检查及官方样例短流程通过；正式准确率待训练验证。[机理说明](docs/signal_mechanism_optimization.md)、[启动指南](docs/supervised_multiresolution.md)。现有weights未替换。
+2026-11-13：当前监督优化候选为 `code/configs/supervised/pyramid_phase.json5`：在原P16/P8/P4金字塔内共享提取多间隔相位谐波与曲率，按各自窗口对齐，以零初始化有界残差参与编码。21.074M参数、共享91.40%；默认从零监督，原学习率和损失不变，尚无正式准确率增益结论。旧配置保留供各自续训。[结构与启动说明](docs/pyramid_phase.md)。
 
 2026-11-11 诊断后优化已完成。全部 118,182 条本地验证记录上，调制 Accuracy **64.23% → 64.50%**，Macro-F1 **64.15% → 64.45%**；协议 Accuracy 保持 **94.42%**，七项参数误差完全一致。默认 `weights/` 已换为验证后的 96.32M 单模型，共享参数占 97.43%；原默认权重已备份。有效改动是冻结原 95M 共享基座，增加均值/标准差与 I/Q 统计读出并重训调制头。监督对比损失、局部残差前端未胜过控制组，默认关闭。提升有限，深层表征和扩参泛化瓶颈尚未解决，所有代理分均不代表官方成绩。完整实测及失败对照见 [本轮优化报告](artifacts/representation_optimization/20261111_122154_915261/report.md)。
 
@@ -125,6 +135,16 @@ logs/                          # 推理日志；各实验另有自己的 train.l
 
 数据处理保证：同内容哈希不跨 split、六个接口样例及其重复组隔离、目标中心/尺度和参数码表只由训练侧计算。元数据不含可用于推理的答案捷径；ID 仅负责记录与回填。
 
+## TensorBoard可视化
+
+训练默认生成 `<时间戳运行目录>/tensorboard/`，记录损失、学习率、梯度、全量验证准确率/F1与参数误差；续训继续原曲线。原版及分段版的历史指标已补录到各自的tensorboard_history。
+
+```bash
+python -m tensorboard.main --logdir logs --host 127.0.0.1 --port 6006
+```
+
+浏览器访问 `http://127.0.0.1:6006`；远程SSH转发、结构化开关及旧进程实时跟随见 [TensorBoard使用说明](docs/tensorboard.md)。
+
 ## 建立联合监督基线
 
 小模型监督对照：
@@ -136,24 +156,24 @@ python code/training/train.py --config code/configs/supervised/small.json
 新多尺度模型单卡监督训练：
 
 ```bash
-python code/training/train.py --config code/configs/supervised/main.json5
+python code/training/train.py --config code/configs/supervised/pyramid_phase.json5
 
-C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest logs/supervised_main)
+C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest logs/supervised_pyramid_phase)
 ```
 
-主监督训练使用`supervised/main.json5`；模型规模、前端、任务头及优化配方均在其中调整，运行时以保存的`resolved_config.json`为准。配置文件支持`//`、`/* */`注释。当前单卡batch256、累计1，有效batch256。cosine、预热和最低学习率比例位于`scheduler`，步数按优化器更新计算。
+当前候选使用`supervised/pyramid_phase.json5`；新增参数集中在`model.phase_relations`，其他优化配方与原金字塔一致，运行时以保存的`resolved_config.json`为准。配置支持`//`、`/* */`注释。单卡batch256、累积1，有效batch256。cosine、预热和最低学习率比例位于`scheduler`，步数按优化器更新计算。
 
 `--max-steps 30` 可做短跑；`--merge-paired` 只在训练侧合并同波形的已知跨任务标签，与不合并分别比较。训练按三个任务等配额轮转，任务内按真实长度比例抽样；这是有放回的均衡更新预算，不等同于每轮恰好遍历每条记录一次。
 
-当前单前端统一基座由hierarchy控制时频前端/BiLSTM/阶段编码，由encoder控制后半段Transformer，hybrid.topology=serial选串行衔接；从零监督LR=3e-4。原完整pt和先前并行组合pt不能直接resume到当前模型。
+当前保留原384×8时频Transformer、两条192维分支与原任务头，新增108,227个共享相位适配参数；中期交互、分段头、hierarchy、hybrid均关闭。三任务共享91.40%权重，从零监督LR=3e-4。原版`pyramid_v1_171823.json5`仍可严格恢复17:18断点；相位版不能resume旧结构优化器，但支持原21M权重零残差热启动，限制见[说明](docs/pyramid_phase.md)。
 
-也可以在 `code/configs/supervised/main.json5` 的 `checkpoint.resume_from` 填入原时间戳目录的 `last.pt`，然后按原命令启动，无需再传 `--resume`；留空表示新训练。`checkpoint.save_every_steps=500` 会在完整优化器更新后定期原子覆盖 `last.pt`，epoch 结束也保存，减少意外中断时损失的进度。续训恢复模型、优化器、cosine、混合精度及 epoch/step，仍写原目录。命令行 `--resume` 优先，`--no-resume` 可忽略配置并新建运行；详见 [配置续训说明](code/configs/README.md#断点续训checkpoint)。
+也可以在`code/configs/supervised/pyramid_phase.json5`的`checkpoint.resume_from`填写同一相位架构运行的last.pt，然后按原命令启动；留空表示新训练。续训恢复模型、优化器、cosine、混合精度及epoch/step并写原目录；旧实验继续使用各自配置。定期保存与严格续训要求见[配置说明](code/configs/README.md#断点续训checkpoint)。
 
-`supervised/main.json5`使用共享前端→局部BiLSTM/窗口阶段编码→token投影→384×8 Transformer核心，追加幅相值保护与深层主导读出。当前19.17M参数、共享91.01%，没有第二套原始信号前端。
+先前`supervised/pyramid_midfusion.json5`及分段头配置保留供历史运行续训；当前候选不叠加这两项改动。
 
 如需热启动既有优化权重`artifacts/representation_optimization/20261111_122154_915261/selected/model.pt`，先使用与其匹配的模型结构，并在run.warmstart_checkpoint填写来源。该合并权重没有原读出训练优化器状态，不能resume；init_checkpoint只保留基座，会重置任务头。
 
-`--output` 指定实验父目录，新训练自动创建上海时区的时间戳子目录，例如`logs/supervised_main/20261112_180000_123456/`。同一命令重复启动会生成不同目录。终端总览会显示实际路径；父目录的`latest_run.json`记录最近创建的运行，上述辅助命令读取该路径。续训应选择确定的检查点，最新目录不等同于最佳模型。
+`--output`指定实验父目录，新训练自动创建上海时区的时间戳子目录，例如`logs/supervised_pyramid_phase/20261113_180000_123456/`。同一命令重复启动会生成不同目录。终端总览显示实际路径，父目录`latest_run.json`记录最近创建的运行。续训应选择确定的检查点，最新目录不等同于最佳模型。
 
 每次运行目录包含 `best.pt`、`last.pt`、`metrics.json`、`parameter_report.json`、`resolved_config.json`、`train.log`、`events.jsonl` 和 `run_info.json`。`best.pt` 按 `evaluation.selection_metric` 选择，当前主配置为调制准确率，同时始终报告协议与参数误差；`auto` 在监督阶段按本地代理分选择，代理分不是官方成绩。断点续训要求保持配置、数据划分、世界大小、词表及配对合并方式一致，并继续写入检查点所在的原目录：
 
@@ -162,7 +182,7 @@ C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest logs/supervised_ma
 `train.log` 保存同样的可读总览、定期进度快照、完整验证表及收尾信息，不再混入 JSON 或终端重绘控制符。机器可读的逐 step/epoch 记录单独写入 `events.jsonl`，完整指标保存在 `metrics.json`。恢复历史 JSON 版日志的运行时，原 `train.log` 会先保留为 `train_legacy.jsonl`（重名时递增后缀），再开始可读日志；旧记录不会丢失。`runtime.progress_bar`、`progress_min_interval` 控制终端进度条，`runtime.log_every` 控制事件及文件内进度快照的步数间隔。
 
 ```bash
-python code/training/train.py --config code/configs/supervised/main.json5
+python code/training/train.py --config code/configs/supervised/pyramid_phase.json5
 ```
 
 ## 预训练候选一：I/Q 掩码重建

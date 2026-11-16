@@ -143,6 +143,23 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
                      f" | label_smoothing={loss['label_smoothing']:g} | 验证/推理不增强")
         lines.append(f"表征目标   : SupCon weight={loss['contrastive']['weight']:g}"
                      f" | temperature={loss['contrastive']['temperature']:g} | 同类不同记录为正样本")
+    mid = model.get('mid_fusion', {})
+    phase = model.get('phase_relations', {})
+    if phase.get('enabled', False):
+        lines.append(f"相位关系   : 单次共享提取 | lags={phase['lags']}原样点 | width={phase['width']}"
+                     f" | 谐波={phase['phase_orders']} / 曲率={phase['curvature_orders']}")
+        lines.append(f"相位注入   : P16首层前 / P8、P4局部块前 | 对齐原窗口mean/std"
+                     f" | 零初始化投影 | 残差增益初值={phase['residual_scale']:g} 上限={phase['max_residual_scale']:g}")
+    if mid.get('enabled', False):
+        lines.append(f"中期交互   : P16第{mid['after_block']}层后 → {mid['tokens']}个{mid['width']}维共享token"
+                     f" / {mid['heads']}头 | 三尺度分别读取、等权汇总、同时残差写回")
+        lines.append(f"交互后编码 : P16剩余{model['encoder']['depth'] - mid['after_block']}层继续编码"
+                     f" | 保留P8/P4原路径与末端交互 | 增益初值={mid['residual_scale']:g}（无硬上限）")
+    temporal = model['heads'].get('modulation_temporal', {})
+    if temporal.get('enabled', False):
+        lines.append(f"调制聚合   : 三尺度全局描述＋有效长度{temporal['segments']}段统计"
+                     f" | 分段宽度={temporal['segment_width']} | 时序卷积核={temporal['temporal_kernel']}"
+                     f" | 残差增益初值={temporal['residual_scale']:g}（可学习，无硬上限）")
     mode = (f"续训 {args.resume}" if args.resume else
             f"加载完整模型 {args.warmstart_checkpoint}" if args.warmstart_checkpoint else
             f"加载基座 {args.init_checkpoint}" if args.init_checkpoint else '随机初始化')

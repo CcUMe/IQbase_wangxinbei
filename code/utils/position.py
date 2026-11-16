@@ -9,7 +9,7 @@ POSITION_DEFAULTS = dict(reference_length=1024, window_head_fraction=.5,
 
 def position_coordinates(lengths, count, patch, heads, mode='samples', options=None, sample_rates=None):
     options = {**POSITION_DEFAULTS, **(options or {})}
-    if mode not in ['samples', 'window', 'dual', 'physical']:
+    if mode not in ['samples', 'window', 'dual', 'physical','rope_fs']:
         raise ValueError(f'Unknown position mode: {mode}')
     reference = options['reference_length']
     if not math.isfinite(reference) or reference <= 0:
@@ -20,7 +20,7 @@ def position_coordinates(lengths, count, patch, heads, mode='samples', options=N
                                lengths[:, None].expand(-1, count).float() / reference), -1)
     if mode == 'samples':
         return samples, coordinates
-    if mode == 'physical':
+    if mode in ['physical','rope_fs']:
         if sample_rates is None:
             known = options['sample_rate_hz']
             if not math.isfinite(known) or known <= 0:
@@ -34,7 +34,10 @@ def position_coordinates(lengths, count, patch, heads, mode='samples', options=N
             raise ValueError('reference_sample_rate_hz must be finite and positive')
         scale = reference_rate / rates
         # Absolute coordinates must use the same physical scale as RoPE.
-        return samples * scale[:, None], coordinates * scale[:, None, None]
+        # Paper Eq.(6), one-based l: (l-1/2)*f0/fs. Keep the historical
+        # physical mode unchanged; it used discrete sample-center coordinates.
+        rotary=(torch.arange(count,device=lengths.device).float()+.5)[None] if mode=='rope_fs' else samples
+        return rotary * scale[:, None], coordinates * scale[:, None, None]
     if not bool((lengths > 0).all()):
         raise ValueError('Window-relative RoPE requires positive lengths')
     window = samples * (reference / lengths.float())[:, None]

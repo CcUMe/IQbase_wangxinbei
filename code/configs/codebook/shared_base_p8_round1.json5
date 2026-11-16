@@ -1,0 +1,27 @@
+// P8原始I/Q词表：不能复用旧P16标签；只在训练侧拟合，不使用教师。
+{
+  "run": {
+    "data": "artifacts/data_full_p8",
+    "output": "artifacts/structure_research_p8/codebook_v1",
+    "teacher_checkpoint": ""
+  },
+  "atomic": {
+    "vocab_size": 512,
+    "max_patches": 200000,
+    "iterations": 20,
+    "chunk_size": 4096
+  },
+  "emergent": {
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000
+  },
+  // 首轮原始特征构词维度仅16，可用CPU准备；训练仍在GPU2,3。
+  "runtime": {
+    "batch_size": 128,
+    "seed": 20261115,
+    "device": "cpu",
+    "threads": 4,
+    "gpus": ""
+  }
+}

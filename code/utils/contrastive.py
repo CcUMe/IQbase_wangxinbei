@@ -56,14 +56,80 @@ def load_with_training_aux(model, state, source_config=None):
             source_config['hybrid'].get('topology', 'parallel') != model.config['hybrid']['topology']):
         raise ValueError('Warmstart requires matching shared-frontend topology')
     if model.multiresolution or source_pyramid or source_hierarchy:
+        adding_phase = False
+        if source_config is not None:
+            from models.multiresolution import mid_fusion_options
+            from models.phase_relations import phase_relation_options
+            old_mid = mid_fusion_options(source_config.get('mid_fusion'))
+            new_mid = model.config['mid_fusion']
+            if (old_mid['enabled'] or new_mid['enabled']) and old_mid != new_mid:
+                raise ValueError('Warmstart requires matching mid_fusion architecture and insertion layer')
+            old_phase = phase_relation_options(source_config.get('phase_relations'))
+            new_phase = model.config['phase_relations']
+            adding_phase = new_phase['enabled'] and not old_phase['enabled']
+            if old_phase['enabled'] and old_phase != new_phase:
+                raise ValueError('Warmstart requires matching phase_relations; cannot discard or reinterpret trained phase features')
+        if (source_config is not None and
+                source_config.get('modulation_temporal', {}).get('enabled', False) !=
+                model.config['modulation_temporal']['enabled']):
+            raise ValueError('Warmstart requires matching modulation_temporal readout; use a checkpoint from the same architecture')
         source_multi = source_pyramid or source_hierarchy
         if (not model.multiresolution or (source_config is not None and not source_multi)
                 or (source_config is not None and source_hybrid != model.hybrid)
                 or (source_config is not None and (source_hierarchy and not source_hybrid) != model.hierarchical)):
             raise ValueError('Warmstart requires matching multi-resolution architecture')
+        if adding_phase:
+            prefix = 'backbone.pyramid.phase_relations.'
+            current = model.state_dict()
+            missing = set(current)-set(state)
+            unexpected = set(state)-set(current)
+            if unexpected or any(not key.startswith(prefix) for key in missing):
+                raise ValueError('Adding phase_relations may only introduce its own new parameters')
+            # The added residual must start at zero even if loading into a model
+            # instance which had previously trained this adapter.
+            with torch.no_grad():
+                for layer in model.backbone.pyramid.phase_relations.projections:
+                    layer.weight.zero_()
+            return model.load_state_dict(state, strict=False)
         return model.load_state_dict(state, strict=True)
     current = model.state_dict()
     state = dict(state)
+    from models.iq_geometry import iq_geometry_options
+    geometry_prefix='backbone.iq_geometry.'
+    source_geometry=(source_config.get('iq_geometry',{}).get('enabled',False) if source_config is not None
+                     else any(key.startswith(geometry_prefix) for key in state))
+    target_geometry=model.config.get('iq_geometry',{}).get('enabled',False)
+    if source_geometry and (not target_geometry or (source_config is not None and
+            iq_geometry_options(source_config.get('iq_geometry'),model.config['patch_size'])!=model.config['iq_geometry'])):
+        raise ValueError('Warmstart cannot discard or reinterpret trained iq_geometry')
+    adding_geometry=target_geometry and not source_geometry
+    if adding_geometry:
+        with torch.no_grad():model.backbone.iq_geometry.up.weight.zero_()
+    from models.patch_shift import patch_shift_options
+    shift_prefix = 'backbone.patch_shift.'
+    source_shift = (source_config.get('patch_shift', {}).get('enabled', False)
+                    if source_config is not None else any(k.startswith(shift_prefix) for k in state))
+    target_shift = model.config.get('patch_shift', {}).get('enabled', False)
+    if source_shift and source_config is not None and patch_shift_options(
+            source_config.get('patch_shift'), model.config['patch_size']) != model.config['patch_shift']:
+        raise ValueError('Warmstart cannot discard or reinterpret a trained patch_shift adapter')
+    adding_shift = target_shift and not source_shift
+    if adding_shift:
+        with torch.no_grad():
+            model.backbone.patch_shift.up.weight.zero_()
+    density_prefixes = ('backbone.time.density.', 'heads.modulation.density_projection.')
+    source_density = (source_config.get('density_encoding', {}).get('enabled', False)
+                      if source_config is not None else any(key.startswith(density_prefixes) for key in state))
+    adding_density = model.config.get('density_encoding', {}).get('enabled', False) and not source_density
+    if adding_density:
+        # A base-model warmstart must restore exact initial behavior even when
+        # reusing an instance whose new residuals have previously been trained.
+        with torch.no_grad():
+            model.backbone.time.density.shared_projection.weight.zero_()
+            model.heads.modulation.density_projection.weight.zero_()
+        for key,value in current.items():
+            if key.startswith(density_prefixes):
+                state[key]=value
     d = model.config['width']
     def layout(config):
         features = [('mean', d)]
@@ -98,6 +164,10 @@ def load_with_training_aux(model, state, source_config=None):
         key.startswith('backbone.time.refinement.') for key in state)
     adding_refinement = model.config.get('local_refinement', False) and not source_refined
     allowed_missing = ('aux.contrastive.',)
+    if adding_geometry:
+        allowed_missing += (geometry_prefix,)
+    if adding_shift:
+        allowed_missing += (shift_prefix,)
     if adding_refinement:
         allowed_missing += ('backbone.time.refinement.',)
     source_multiscale = source_config.get('multiscale_frontend', False) if source_config is not None else any(

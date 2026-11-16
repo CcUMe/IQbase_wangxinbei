@@ -37,7 +37,7 @@ def describe(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=Path('code/configs/supervised/main.json5'))
+    parser.add_argument('--config', type=Path, required=True, help='Explicit serial-model config; this historical audit is not for the current pyramid model')
     parser.add_argument('--data', type=Path)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()

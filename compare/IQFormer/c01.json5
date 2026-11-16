@@ -1,0 +1,82 @@
+{
+  "run": {
+    // Paths are relative to the project root, independent of shell cwd.
+    "data": "artifacts/data_full",
+    "output": "logs/compare_iqformer"
+  },
+  "data": {
+    "batch_size": 128,
+    "eval_batch_size": 128,
+    "num_workers": 4,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "prefetch_factor": 2,
+    // One pass over MODULATION training rows per epoch; no other-task updates.
+    "repeats_per_epoch": 1
+  },
+  "input": {
+    // Matches downloaded upstream code: no per-record RMS normalization.
+    // Optional "rms" is an explicit preprocessing experiment, not the baseline.
+    "normalization": "rms",
+    "rms_epsilon": 1e-12,
+    "phase_rotation_probability": 0.0,
+    // main.py uses dataset.py window=31 even for HisarMod. Paper says 61.
+    // Preserve code's default. FFT=128, hop=1, first 32 bins, REAL part.
+    "stft_window": 31
+  },
+  "model": {
+    // Exact long-input constructor in the downloaded upstream/main.py.
+    "layers": [3, 3, 3],
+    "embed_dims": [64, 64, 64],
+    "mlp_ratios": 4.0,
+    "down_patch_size": 3,
+    "down_stride": 2,
+    "down_pad": 1,
+    "drop_rate": 0.2,
+    "drop_path_rate": 0.2,
+    "use_layer_scale": false,
+    "layer_scale_init_value": 1e-5,
+    "vit_num": 1
+  },
+  "training": {
+    "epochs": 60,
+    "label_smoothing": 0.0,
+    // 0 disables clipping, matching upstream. Norms are still recorded.
+    "gradient_clip": 0.0,
+    "early_stopping_patience": 10,
+    "early_stopping_min_delta": 0.0,
+    // 0 means full data. Nonzero limits are for smoke checks only.
+    "max_train_batches": 0,
+    "max_val_batches": 0
+  },
+  "optimizer": {
+    "learning_rate": 0.001,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.999],
+    "eps": 1e-8
+  },
+  "scheduler": {
+    // Official recipe: ReduceLROnPlateau on validation CE.
+    // Optional "cosine" uses warmup_epochs/min_lr; explicit recipe deviation.
+    "name": "plateau",
+    "factor": 0.5,
+    "patience": 3,
+    "threshold": 0.0001,
+    "min_lr": 0.00005,
+    "warmup_epochs": 0
+  },
+  "runtime": {
+    // Single GPU: launch with CUDA_VISIBLE_DEVICES=1. --device cpu is supported.
+    "device": "auto",
+    "precision": "fp32",
+    "seed": 2026,
+    "threads": 4,
+    "deterministic": false,
+    "allow_tf32": false
+  },
+  "logging": {
+    "log_every_steps": 50,
+    "progress_bar": true,
+    "tensorboard": true
+  }
+}

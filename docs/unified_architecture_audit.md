@@ -1,5 +1,7 @@
 # 单前端统一基座：组件拆分与兼容性审计
 
+> 状态更新（2026-11-13）：本文涉及的串行／BiLSTM架构方案已撤下，不作为当前训练依据。原技术描述仅为历史记录。当前入口是 `code/configs/supervised/pyramid_v1_171823.json5`；原运行日志保留。
+
 最新更新：当前已启用信息保留与模块分工优化，组件语义以[本轮优化说明](signal_mechanism_optimization.md)为准，完整尺寸新审计位于artifacts/unified_component_audit/20261112_200611_521773；下文保留机制优化前的尺寸与衔接分析。
 
 2026-11-12，Asia/Shanghai。入口：`code/configs/supervised/main.json5`，`model.hybrid.topology="serial"`。

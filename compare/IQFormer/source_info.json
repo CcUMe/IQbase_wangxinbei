@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/WestdoorSad/IQFormer",
+  "commit": "7ee6ac949551b24d45f218762cab919e0cb6b4f9",
+  "official_model_sha256": "667ee6c7d5ccd14d8ef0a66e2bfad2c4463b80fe32e77328c2c4708c597ab014",
+  "adapted_model_sha256": "b1f2a18a872dfbf7bf0037c1817c06b7f9ec4ff1278c2f25d95dc0fc707327c6",
+  "adaptations": [
+    "Two timm import lines redirected to local equivalent helpers; no torchvision/timm dependency.",
+    "Unqualified torch.squeeze replaced with squeeze(2): batch size 1 retains its batch dimension."
+  ],
+  "preset": "Downloaded upstream/main.py HisarMod/long-sequence constructor, not paper Table I.",
+  "stft": "Downloaded upstream/dataset/dataset.py: real part of I-channel Blackman STFT, window31, overlap30, nfft128, first32 bins."
+}

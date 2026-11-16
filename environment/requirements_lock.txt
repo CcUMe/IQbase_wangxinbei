@@ -4,3 +4,4 @@ torch==2.13.0+cu130
 numpy==2.5.1
 pyarrow==25.0.0
 tqdm==4.70.0
+tensorboard==2.21.0

@@ -1,0 +1,258 @@
+// 当前优化候选：原金字塔编码器＋调制全局/分段统计。尚无正式准确率收益结论。
+// 保留原协议/参数头、RMS与频谱通路，以及全部采样/损失/AdamW/cosine配方。
+// 默认从零训练；旧17:18的last.pt只能配旧配置严格resume，不可改用本配置。
+// 原版保留于pyramid_v1_171823.json5；本配置输出到独立的logs/supervised_pyramid_temporal。
+{
+  "schema_version": 2,
+  "experiment": {
+    "name": "pyramid_temporal",
+    "description": "从零监督：保留P16/P8/P4金字塔基座，仅增强调制头的全局＋四段均值/标准差时序聚合；协议与七参数头保持原结构。"
+  },
+  "run": {
+    "data": "artifacts/data_full",
+    "output": "logs/supervised_pyramid_temporal",
+    "codebook": "",
+    "init_checkpoint": "",
+    "warmstart_checkpoint": ""
+  },
+  "model": {
+    "encoder": {
+      "width": 384,
+      "depth": 8,
+      "heads": 6,
+      "mlp_ratio": 4.0,
+      "dropout": 0.1,
+      "attention_dropout": 0.1,
+      "rope_base": 10000.0,
+      "qk_normalization": true,
+      "qk_scale": 1.0
+    },
+    "signal": {
+      "patch_size": 16,
+      "stft_window": 64,
+      "phase_features": true,
+      "global_spectrum": true,
+      "spectral_backend": "fft",
+      "position": "samples",
+      "rms_epsilon": 1e-06,
+      "normalize_fusion": false,
+      "local_refinement": false,
+      "position_options": {
+        "reference_length": 1024,
+        "window_head_fraction": 0.5,
+        "absolute_features": true,
+        "sample_rate_hz": 0.0,
+        "reference_sample_rate_hz": 1.0
+      },
+      "scale_embedding": true,
+      "global_spectrum_input": true,
+      "multiscale_frontend": false
+    },
+    "heads": {
+      "parameter_mode": "grid_residual",
+      "classification_hidden_ratio": 0.5,
+      "grid_residual_scale": 0.1,
+      "parameter_query_temperature": 1.0,
+      "contrastive_projection_dim": 128,
+      "classification_pooling": "multiscale_attention_stats",
+      "physical_statistics": false,
+      "classification_fp32": true,
+      "multiscale_readout": {
+        "projection_width": 256,
+        "modulation_hidden": 256,
+        "protocol_hidden": 128,
+        "parameter_hidden": 128,
+        "dropout": 0.1,
+        "variance_epsilon": 1e-06
+      },
+      "modulation_temporal": {
+        "enabled": true, // 开启调制分段聚合；false恢复原全局读出结构。
+        "segments": 4, // 每个尺度按各样本有效token顺序分段；不是符号数，也不随padding变动。
+        "segment_width": 64, // 每段均值/标准差的投影宽度；4×64按顺序进入尺度内聚合。
+        "temporal_kernel": 3, // 分段序列上的卷积核，须为正奇数；不是原始I/Q卷积核。
+        "dropout": 0.1, // 新增分段聚合支路的dropout；全局头和主干dropout保持原值。
+        "residual_scale": 0.1 // 可学习残差增益初值，须>0；没有硬上限，也不限制哪个尺度主导。
+      }
+    },
+    "pyramid": {
+      "enabled": true,
+      "width": 192,
+      "heads": 3,
+      "stem_complex_channels": 48,
+      "local_blocks": 2,
+      "transformer_depth": 1,
+      "ffn_hidden": 512,
+      "dropout": 0.1,
+      "attention_dropout": 0.1,
+      "residual_scale": 0.1,
+      "mid": {
+        "kernel": 16,
+        "stride": 8,
+        "padding": 4,
+        "groups": 16
+      },
+      "fine": {
+        "kernel": 8,
+        "stride": 4,
+        "padding": 2,
+        "groups": 32
+      }
+    },
+    "hierarchy": {
+      "enabled": false,
+      "mechanism": {
+        "enabled": false
+      }
+    },
+    "hybrid": {
+      "enabled": false,
+      "topology": "parallel"
+    }
+  },
+  "data": {
+    "batch_size": 256,
+    "steps_per_epoch": 0,
+    "merge_paired": false,
+    "augmentation": {
+      "phase_rotation_probability": 0.0,
+      "modulation_only": {
+        "phase_rotation_probability": 0.0,
+        "circular_shift_probability": 0.0
+      }
+    },
+    "sampling": {
+      "mode": "balanced",
+      "task_probabilities": {
+        "modulation": 1.0,
+        "protocol": 1.0,
+        "parameter": 1.0
+      }
+    },
+    "loader": {
+      "num_workers": 4,
+      "pin_memory": true,
+      "persistent_workers": false,
+      "prefetch_factor": 2
+    }
+  },
+  "training": {
+    "stage": "supervised",
+    "epochs": 40,
+    "max_steps": 0,
+    "gradient_accumulation_steps": 1,
+    "gradient_clip": 1.0
+  },
+  "finetuning": {
+    "strategy": "full",
+    "head_warmup_steps": 500,
+    "upper_layers_steps": 1500,
+    "unfreeze_last_n_blocks": 4,
+    "layer_lr_decay": 1.0,
+    "frontend_lr_factor": 1.0,
+    "anchor_weight": 0.0,
+    "validation_every_steps": 0,
+    "validate_stage_boundaries": true
+  },
+  "optimizer": {
+    "name": "adamw",
+    "learning_rate": 0.0003,
+    "backbone_lr_factor": 1.0,
+    "weight_decay": 0.01,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "exclude_bias_and_norm_from_decay": true,
+    "skip_inactive_heads": true
+  },
+  "scheduler": {
+    "name": "cosine",
+    "warmup_steps": 500,
+    "warmup_ratio": 0.0,
+    "warmup_start_factor": 0.0,
+    "min_lr_ratio": 0.05
+  },
+  "loss": {
+    "supervised": {
+      "task_weights": {
+        "modulation": 1.0,
+        "protocol": 1.0,
+        "parameter": 1.0
+      },
+      "contrastive": {
+        "weight": 0,
+        "temperature": 0.1,
+        "gather_distributed": true
+      },
+      "label_smoothing": 0.0,
+      "regression": "mse",
+      "huber_delta": 1.0,
+      "parameter_weights": {
+        "symbol_rate": 1.0,
+        "bandwidth": 1.0,
+        "frequency_shift": 1.0,
+        "pulse_width": 1.0,
+        "pri": 1.0,
+        "time_delay": 1.0,
+        "number_of_pulses": 1.0
+      },
+      "grid_weight": 0.1
+    },
+    "pretraining": {
+      "mask": {
+        "ratio": 0.3,
+        "span": 2,
+        "strategy": "random",
+        "energy_fraction": 0.5,
+        "energy_floor": 0.05
+      },
+      "weights": {
+        "reconstruction": 0.0,
+        "atomic": 1.0,
+        "emergent": 1.0,
+        "spectrum": 0.0
+      },
+      "equalize_emergent_spans": false
+    }
+  },
+  "evaluation": {
+    "every_epochs": 1,
+    "batch_size": 256,
+    "max_batches": 0,
+    "precision": "fp32",
+    "mask_seed": 12345,
+    "selection_metric": "modulation_accuracy",
+    "early_stopping": {
+      "patience": 8,
+      "min_delta": 0.001
+    },
+    "proxy_task_weights": {
+      "modulation": 30.0,
+      "protocol": 30.0,
+      "parameter": 40.0
+    }
+  },
+  "checkpoint": {
+    "resume_from": "",
+    "save_last": true,
+    "save_best": true,
+    "save_best_modulation": true,
+    "save_best_proxy": true,
+    "save_every_steps": 500,
+    "save_every_epochs": 0
+  },
+  "runtime": {
+    "device": "auto",
+    "gpus": "1",
+    "processes": 1,
+    "precision": "bf16",
+    "seed": 2026,
+    "threads": 4,
+    "log_every": 50,
+    "deterministic": false,
+    "allow_tf32": false,
+    "progress_bar": true,
+    "progress_min_interval": 0.5
+  }
+}

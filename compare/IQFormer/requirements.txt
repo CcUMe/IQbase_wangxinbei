@@ -1,0 +1,9 @@
+# Install in the existing PyTorch environment; no torchvision/timm required.
+numpy>=1.24
+scipy>=1.10
+torch>=2.1
+einops>=0.8,<0.9
+tqdm>=4.66
+tensorboard>=2.18,<3
+# Only predict_c01.py (official Parquet input) needs pyarrow.
+pyarrow>=14

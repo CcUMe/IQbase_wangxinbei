@@ -1,7 +1,22 @@
 # 配置目录与参数说明
 
-2026-11-12更新：supervised/main.json5使用单前端串行统一基座，并启用hierarchy.mechanism：局部上下文、六值幅相保留、全局谱后移、深层主导调制读出。19.17M参数、共享91.01%。[当前运行指南](../../docs/supervised_multiresolution.md)、[机理说明](../../docs/signal_mechanism_optimization.md)。
-保留的 17:18 历史版本：[`supervised/pyramid_v1_171823.json5`](supervised/pyramid_v1_171823.json5)，原 Transformer＋中／细尺度分支，20.97M 参数；[训练、续训及源码快照说明](../../docs/pyramid_v1_171823.md)。新训练输出到 `logs/supervised_pyramid_v1/`，与当前 main 分开。
+统一P8候选入口为`{supervised,pretrain,finetune}/shared_base_p8.json5`，三阶段共享P8骨干；独立流程配置为[pipeline/shared_base_iterative_p8_dual.json5](pipeline/shared_base_iterative_p8_dual.json5)。默认GPU2,3，每卡128，30轮→新模型构词→50轮→微调20轮，预训练跨度8、比例30%。启动`bash code/training/run_iterative_pretrain_p8_dual.sh`；需新P8缓存及第一轮词表，不能混用旧P16标签。[P8说明](../../docs/shared_base_p8_training.md)。原P16入口保留。
+
+2026-11-15当前共享基座正式配置（统一交给`code/training/train.py`）：
+
+| 阶段 | 配置 |
+| --- | --- |
+| 从头有监督 | [supervised/shared_base.json5](supervised/shared_base.json5) |
+| 结构预训练 | [pretrain/shared_base.json5](pretrain/shared_base.json5) |
+| 预训练基座微调 | [finetune/shared_base.json5](finetune/shared_base.json5) |
+
+三者共享768×12、P16主干和同一`iq_geometry`设置，预训练关闭增强、监督/微调仅前14类相位增强。预训练正式配置现为原始I/Q的v1词表、30轮。完整迭代流程入口：`bash code/training/run_iterative_pretrain.sh`；[pipeline/shared_base_iterative.json5](pipeline/shared_base_iterative.json5)集中配置第一轮30轮、新模型构词参数、第二轮50轮；最后沿用微调正式配置的20轮。实际第二轮与微调配置在流程目录内冻结，并绑定本次精确权重。[架构、配置、恢复与日志说明](../../docs/shared_base_training.md)。以下为保留的历史实验。
+
+双卡入口：`bash code/training/run_iterative_pretrain_dual.sh`，对应[pipeline/shared_base_iterative_dual.json5](pipeline/shared_base_iterative_dual.json5)。`runtime.gpu`选择0,1或2,3或4,5，`processes=2`；`data.batch_size_per_gpu=128`对应全局256。构词用组内第一张卡、单进程。流程参数不会改变三阶段共享骨干或输入语义；每次启动冻结实际阶段配置，恢复不能改卡数和批量。
+
+2026-11-14新增[`supervised/shift_consistent.json5`](supervised/shift_consistent.json5)：从67.57%候选进行单次24,000步长训练，使用共享Patch偏移适配器和原始/增强成对监督。此配置属于专用`train_shift_consistent.py`，不交给旧`train.py`解析。后台启动：`bash code/training/run_shift_consistent.sh`。[详细说明](../../docs/shift_consistent_training.md)。
+
+2026-11-13更新：当前监督候选为[`supervised/pyramid_phase.json5`](supervised/pyramid_phase.json5)，在原金字塔内共享提取多间隔相位谐波与曲率，按P16/P8/P4窗口对齐后以零初始化有界残差参与编码。21.074M参数、共享91.40%，尚无正式精度收益结论。原版及旧候选配置保留，用各自配置续训。[结构与启动说明](../../docs/pyramid_phase.md)。
 
 配置按用途分目录，每个实验是一份完整JSON，可以直接运行；不使用配置继承、隐式合并或软链接。同一实验的模型、数据、损失、训练预算和GPU设置都在自己的文件中。
 
@@ -25,8 +40,10 @@ configs/
     round2_continue.json            # 适配第二轮继承方案
     round2_scratch.json             # 适配第二轮随机初始化方案
   supervised/
-    main.json5                      # 当前单前端串行基座
-    pyramid_v1_171823.json5          # 17:18历史Transformer＋中/细尺度版本
+    pyramid_phase.json5             # 当前候选：共享局部相位关系适配，原金字塔与任务头
+    pyramid_midfusion.json5         # 先前中期交互候选，保留供历史运行续训
+    pyramid_temporal.json5          # 先前分段调制头候选，保留用于已有运行续训
+    pyramid_v1_171823.json5          # 原版基线与17:18断点续训
     small.json                      # 小模型连续回归对照
     comparisons/
       small_reference.json          # 384×8参考配置
@@ -42,7 +59,7 @@ configs/
     pretrain.json                   # 微型混合预训练流程检查
 ```
 
-预训练/微调配置保持原架构；当前监督入口将一套共享前端、阶段编码和Transformer核心串接。旧完整pt不能直接resume，新模型从零监督；原Transformer核心保留key和shape，迁移效果仍未验证。
+预训练/微调配置保持原架构；当前候选为原金字塔＋共享相位适配，从零监督，尚未接入结构预训练。严格resume必须使用对应架构的配置；相位版支持从原21M金字塔完整热启动并新增零残差，但不复用旧优化器／调度。旧运行仍用各自配置，已撤下串行方案不兼容。
 
 ## 短命令启动
 
@@ -84,7 +101,7 @@ python code/training/train.py --config code/configs/finetune/round2_scratch.json
 日常监督训练：
 
 ```bash
-python code/training/train.py --config code/configs/supervised/main.json5
+python code/training/train.py --config code/configs/supervised/pyramid_phase.json5
 ```
 
 评估、导出、推理：
@@ -107,6 +124,10 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 
 手动停止按一次Ctrl+C后等待整组退出。中断不会临时保存额外检查点，应从最近完整的last.pt恢复。训练/推理入口已增加异常清理、启动器死亡保护及退出超时兜底，详见[停止说明](../../docs/device_compatibility.md#手动停止与异常退出)。
 
+## TensorBoard：logging.tensorboard
+
+所有训练配置默认启用，当前phase配置显式列出enabled、log_every_steps、flush_secs、max_queue和classwise_metrics。0记录间隔跟随runtime.log_every，事件放在本次运行的tensorboard子目录，仅rank0写入。切换可视化开关不影响严格resume匹配。[完整使用说明](../../docs/tensorboard.md)。
+
 ## 断点续训：checkpoint
 
 ```json
@@ -127,11 +148,11 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 
 每份训练配置独立保存全部参数，读取支持//与/* */注释；未知字段和明显不一致的设置会报错。实际运行会在时间戳目录保存resolved_config.json。若复制配置开展新实验，应同步修改experiment.name和run.output。
 
-以下保留参数详解；当前入口使用hierarchy控制统一主干前半段、encoder控制Transformer核心、hybrid.topology=serial选单前端串行结构。旧pyramid和并行模式不启用。
+以下保留参数详解；当前候选使用encoder控制原Transformer，pyramid控制原中／细尺度分支，heads控制原读出。新增参数集中在model.phase_relations，包含lag、谐波／曲率阶数、编码宽度、数值保护、局部核、dropout和有界增益，配置内逐项注释。mid_fusion、modulation_temporal、hierarchy、hybrid均关闭。
 
 ## 模型：`model`
 
-本轮新增参数集中在原分组内，未新增主配置文件：
+下表保留历史研究接口，不代表当前phase配置取值；当前配置中的physical_statistics=false、classification_pooling=multiscale_attention_stats：
 
 | 参数 | 当前值 | 含义与使用条件 |
 |---|---|---|
@@ -144,7 +165,7 @@ deployment是共用工具配置，保留原来的第一轮微调来源。评估�
 | `loss.supervised.contrastive.temperature` | `0.1` | 对比 softmax 温度，必须大于 0；减小会强化困难负样本 |
 | `loss.supervised.contrastive.gather_distributed` | `true` | 使用可反传的跨卡正/负样本；排除重复采到同一记录，按全局有效锚点数归一化 |
 
-缺省设置保持旧模型语义：均值池化，物理统计、FP32 分类头和局部残差前端均关闭；当前`supervised/main.json5`启用新的多分辨率读出，支持范围见监督模型指南。旧架构的增补统计特征热启动可为新增输入列补零；这不适用于新旧多分辨率架构之间的权重迁移。
+缺省设置保持旧模型语义；当前`supervised/pyramid_phase.json5`显式保留多分辨率FP32读出，并新增共享相位适配器。只有原金字塔到新增零残差适配的完整热启动受到支持，不泛化为任意多分辨率结构之间的迁移，详见[相位版说明](../../docs/pyramid_phase.md)。
 
 三项假设诊断新增了同属 `model.signal` 的研究开关，当前主配置无需改动：`scale_embedding=true` 保留原始 RMS 尺度回注；`global_spectrum_input=true` 保留全局频谱回注；`multiscale_frontend=false` 关闭 Patch 前 dilation=1/4/16 并行残差。前两个开关置 false 时保留模块及共同初始化，只将该路径贡献置零；`global_spectrum=false` 则直接不建立全局模块，两者含义不同。本轮匹配预算下，去尺度、去全局回注和多尺度前端均未提高调制识别，不推荐直接启用这些改动。详细指标见 [假设验证报告](../../artifacts/hypothesis_validation/20261111_155810_763553/report.md)。
 
@@ -266,7 +287,7 @@ cosine 按**优化器更新**调度：先线性预热，再余弦下降。在完
 
 `train.log` 是终端总览、定期进度、逐类验证表和收尾信息的可读文本，去掉进度条的回车重绘；事件保存在 `events.jsonl`。恢复历史运行时，如果原 `train.log` 是 JSON 行，将原样保留到 `train_legacy.jsonl`，重名时递增后缀，再建立新的可读日志。历史指标和记录不会删除。
 
-`evaluation.early_stopping`按selection_metric判断，patience=0关闭；开启时要求全量验证。min_delta使用指标的绝对单位，Accuracy下0.001代表0.1个百分点。早停计数随checkpoint恢复，不影响任何微小新高的best保存；新main默认patience=8。
+`evaluation.early_stopping`按selection_metric判断，patience=0关闭；开启时要求全量验证。min_delta使用指标的绝对单位，Accuracy下0.001代表0.1个百分点。早停计数随checkpoint恢复，不影响任何微小新高的best保存；当前金字塔入口patience=8。
 
 ## 数据准备、词表与推理参数
 
@@ -297,7 +318,7 @@ python code/infer.py --config code/configs/deployment/inference.json
 | pretrain_structure.json | [pretrain/round2_continue.json](pretrain/round2_continue.json) |
 | pretrain_reconstruction.json | [pretrain/reconstruction.json](pretrain/reconstruction.json) |
 | finetune.json | [finetune/round1.json5](finetune/round1.json5) |
-| main.json5 | [supervised/main.json5](supervised/main.json5) |
+| main.json / main.json5（已撤下） | [supervised/pyramid_v1_171823.json5](supervised/pyramid_v1_171823.json5)；架构不同，旧串行pt不能直接续训 |
 | small.json | [supervised/small.json](supervised/small.json) |
 | main_small_reference.json | [supervised/comparisons/small_reference.json](supervised/comparisons/small_reference.json) |
 | main_large_30e.json | [supervised/comparisons/large_30e.json](supervised/comparisons/large_30e.json) |
@@ -308,3 +329,11 @@ python code/infer.py --config code/configs/deployment/inference.json
 | evaluation.json | [deployment/evaluation.json](deployment/evaluation.json) |
 | export.json | [deployment/export.json](deployment/export.json) |
 | inference.json | [deployment/inference.json](deployment/inference.json) |
+
+## 真实C01调制优化实验
+
+[supervised/density_optimization.json5](supervised/density_optimization.json5)是配对实验配置，由`python code/training/optimize_density.py --config <该文件>`读取，不直接交给常规`train.py`。`--arms`选择普通续训、分布编码或定向增强等方法；每种方法独立训练和导出，不进行预测集成。完整说明和实际结果见[调制优化入口](../../docs/modulation_optimization.md)与[真实实验报告](../../docs/research/C01_共享基座调制优化实验_20261114.md)。
+
+常规训练配置也新增`data.augmentation.modulation_only.class_indices`：空列表表示全部调制类别，`[0,1,2,3,4,5,6,7,8,9,10,11,12,13]`限定前14类。它与同级相位/时移概率配合，只影响监督训练中的纯调制记录。原配置默认空列表，行为保持一致；推理不读取类别标签。
+
+同级`apply_probability`控制整体增强资格，默认1保持原行为。例如0.5表示约一半符合条件的记录保留原始视图，其余再按相位/时移概率变换；它不等价于分别把两个概率设为0.5。本轮50%原始＋50%相位增强未超过全量相位方案，保留为可复现实验开关。结果见[相位/时移拆分与种子复核](../../docs/research/C01_相位时移拆分与原始视图实验_20261114.md)。

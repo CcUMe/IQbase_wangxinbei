@@ -9,6 +9,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from models.phase_relations import PhaseRelationAdapter, phase_relation_options
 
 
 PYRAMID_DEFAULTS = dict(
@@ -19,6 +20,48 @@ PYRAMID_DEFAULTS = dict(
     fine=dict(kernel=8, stride=4, padding=2, groups=32))
 READOUT_DEFAULTS = dict(projection_width=256, modulation_hidden=256, protocol_hidden=128,
                         parameter_hidden=128, dropout=0.1, variance_epsilon=1e-6)
+TEMPORAL_READOUT_DEFAULTS = dict(enabled=False, segments=4, segment_width=64,
+                                 temporal_kernel=3, dropout=0.1, residual_scale=0.1)
+MID_FUSION_DEFAULTS = dict(enabled=False, after_block=4, tokens=8, width=192, heads=3,
+                          dropout=0.1, residual_scale=0.1)
+
+
+def mid_fusion_options(options=None, depth=None):
+    if options is not None and (not isinstance(options, dict) or set(options) - set(MID_FUSION_DEFAULTS)):
+        raise ValueError('Unknown mid_fusion option')
+    result = {**MID_FUSION_DEFAULTS, **(options or {})}
+    if type(result['enabled']) is not bool:
+        raise ValueError('mid_fusion.enabled must be boolean')
+    for key in ['after_block', 'tokens', 'width', 'heads']:
+        if type(result[key]) is not int or result[key] <= 0:
+            raise ValueError(f'mid_fusion.{key} must be a positive integer')
+    if result['width'] % result['heads']:
+        raise ValueError('mid_fusion.width must be divisible by heads')
+    if result['enabled'] and depth is not None and not 0 < result['after_block'] < depth:
+        raise ValueError('mid_fusion.after_block must leave at least one later Transformer block')
+    if not math.isfinite(result['dropout']) or not 0 <= result['dropout'] < 1:
+        raise ValueError('mid_fusion.dropout must be in [0,1)')
+    if not math.isfinite(result['residual_scale']) or result['residual_scale'] <= 0:
+        raise ValueError('mid_fusion.residual_scale must be positive')
+    return result
+
+
+def temporal_readout_options(options=None):
+    if options is not None and (not isinstance(options, dict) or set(options) - set(TEMPORAL_READOUT_DEFAULTS)):
+        raise ValueError('Unknown modulation_temporal option')
+    result = {**TEMPORAL_READOUT_DEFAULTS, **(options or {})}
+    if type(result['enabled']) is not bool:
+        raise ValueError('modulation_temporal.enabled must be boolean')
+    for key in ['segments', 'segment_width', 'temporal_kernel']:
+        if type(result[key]) is not int or result[key] <= 0:
+            raise ValueError(f'modulation_temporal.{key} must be a positive integer')
+    if result['temporal_kernel'] % 2 != 1:
+        raise ValueError('modulation_temporal.temporal_kernel must be odd')
+    if not math.isfinite(result['dropout']) or not 0 <= result['dropout'] < 1:
+        raise ValueError('modulation_temporal.dropout must be in [0,1)')
+    if not math.isfinite(result['residual_scale']) or result['residual_scale'] <= 0:
+        raise ValueError('modulation_temporal.residual_scale must be positive')
+    return result
 
 
 def pyramid_options(options=None):
@@ -142,6 +185,45 @@ class CrossAttention(nn.Module):
         return self.out(h.transpose(1, 2).reshape(b, nq, d))
 
 
+class MidScaleFusion(nn.Module):
+    """One balanced gather/broadcast exchange; original token streams remain.
+
+    Each scale has its own masked softmax before equal averaging, so longer
+    scales do not receive more source mass solely from having more tokens.
+    The same updated latents broadcast to all three unmodified input streams.
+    """
+    def __init__(self, widths, options):
+        super().__init__()
+        d, heads, dropout = options['width'], options['heads'], options['dropout']
+        self.input_norms = nn.ModuleList([nn.LayerNorm(w) for w in widths])
+        self.inputs = nn.ModuleList([nn.Linear(w, d) for w in widths])
+        self.position = nn.Sequential(nn.Linear(2, d), nn.Tanh())
+        self.scale_embedding = nn.Embedding(3, d)
+        self.latents = nn.Embedding(options['tokens'], d)
+        nn.init.normal_(self.latents.weight, std=.02)
+        self.collect = CrossAttention(d, heads, dropout)
+        self.broadcast = CrossAttention(d, heads, dropout)
+        self.outputs = nn.ModuleList([nn.Linear(d, w) for w in widths])
+        self.gains = nn.ParameterList([nn.Parameter(torch.full((w,), options['residual_scale'])) for w in widths])
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, features, masks, centers, lengths):
+        memories = []
+        for i, (norm, projection, h, valid, center) in enumerate(zip(self.input_norms, self.inputs, features, masks, centers)):
+            coordinates = torch.stack((center[None].expand(len(lengths), -1) / 1024,
+                                       lengths[:, None].expand(-1, len(center)).float() / 1024), -1)
+            memory = projection(norm(h)) + self.position(coordinates) + self.scale_embedding.weight[i]
+            memories.append(memory * valid[..., None])
+        seed = self.latents.weight[None].expand(len(lengths), -1, -1)
+        collected = [self.collect(seed, memory, valid) for memory, valid in zip(memories, masks)]
+        latent = seed + self.dropout(torch.stack(collected).mean(0))
+        latent_valid = torch.ones(latent.shape[:2], dtype=torch.bool, device=latent.device)
+        updates = [projection(self.broadcast(memory, latent, latent_valid))
+                   for projection, memory in zip(self.outputs, memories)]
+        return [(h + self.dropout(update) * gain) * valid[..., None]
+                for h, update, gain, valid in zip(features, updates, self.gains, masks)]
+
+
 class FineBranch(nn.Module):
     def __init__(self, options, name, patch_size, rope_base):
         super().__init__()
@@ -154,12 +236,14 @@ class FineBranch(nn.Module):
         self.blocks = nn.ModuleList([FineTransformer(options, rope_base) for _ in range(options['transformer_depth'])])
         self.norm = nn.LayerNorm(d)
 
-    def forward(self, stem, lengths):
+    def forward(self, stem, lengths, phase_update=None):
         x = self.patch(stem).transpose(1, 2)
         centers = torch.arange(x.shape[1], device=x.device).float() * self.spec['stride']
         centers = centers - self.spec['padding'] + (self.spec['kernel'] - 1) / 2
         valid = torch.arange(x.shape[1], device=x.device)[None] < (lengths // self.spec['stride'])[:, None]
         x = F.silu(self.input_norm(x)) * valid[..., None]
+        if phase_update is not None:
+            x = (x + phase_update.to(x.dtype)) * valid[..., None]
         for block in self.local:
             x = block(x, valid)
         positions = (centers / self.reference_stride)[None].expand(len(lengths), -1)
@@ -170,7 +254,7 @@ class FineBranch(nn.Module):
 
 class MultiResolutionPyramid(nn.Module):
     """Registered under backbone; every task reads all three shared scales."""
-    def __init__(self, coarse_width, patch_size, rope_base, options):
+    def __init__(self, coarse_width, patch_size, rope_base, options, mid_fusion=None, phase_relations=None):
         super().__init__()
         self.options, self.patch_size = options, patch_size
         d, stem = options['width'], options['stem_complex_channels']
@@ -187,27 +271,51 @@ class MultiResolutionPyramid(nn.Module):
         self.cross_scale = nn.ModuleList([CrossAttention(d, options['heads'], options['attention_dropout']) for _ in range(3)])
         self.summary_out = nn.ModuleList([nn.Linear(d, w) for w in widths])
         self.summary_scale = nn.Parameter(torch.full((3, d), options['residual_scale']))
+        self.mid_fusion = None
+        mid_options = mid_fusion_options(mid_fusion)
+        if mid_options['enabled']:
+            # Keep all pre-existing encoder and head initialization at fixed seed.
+            with torch.random.fork_rng(devices=[]):
+                self.mid_fusion = MidScaleFusion(widths, mid_options)
+        self.phase_relations = None
+        phase_options = phase_relation_options(phase_relations)
+        if phase_options['enabled']:
+            # Preserve every pre-existing backbone/head tensor at a fixed seed.
+            with torch.random.fork_rng(devices=[]):
+                self.phase_relations = PhaseRelationAdapter(widths, patch_size, options, phase_options)
 
     def coordinate_embedding(self, centers, lengths):
         coordinates = torch.stack((centers[None].expand(len(lengths), -1) / 1024,
                                    lengths[:, None].expand(-1, len(centers)).float() / 1024), -1)
         return self.position(coordinates)
 
-    def forward(self, coarse, coarse_valid, context, lengths):
+    def encode_details(self, context, coarse_valid, lengths):
         x = context['iq']
         point_valid = context['point_valid']
         stem = self.stem(x.transpose(1, 2)).transpose(1, 2)
         stem = (F.silu(self.stem_norm(stem)) * point_valid[..., None]).transpose(1, 2)
-        coarse_centers = torch.arange(coarse.shape[1], device=x.device).float() * self.patch_size + (self.patch_size - 1) / 2
-        features, masks, centers = [coarse], [coarse_valid], [coarse_centers]
+        coarse_centers = torch.arange(coarse_valid.shape[1], device=x.device).float() * self.patch_size + (self.patch_size - 1) / 2
+        features, masks, centers = [], [], []
         frequency = self.frequency_projection(context['frequency']) + self.coordinate_embedding(coarse_centers, lengths)
         for i, branch in enumerate(self.branches):
-            h, valid, center = branch(stem, lengths)
+            phase = context.get('phase_updates')
+            h, valid, center = branch(stem, lengths, phase_update=phase[i+1] if phase is not None else None)
             pos = self.coordinate_embedding(center, lengths)
             h = (h + self.time_frequency[i](h + pos, frequency, coarse_valid) * self.frequency_scale[i]) * valid[..., None]
             features.append(h)
             masks.append(valid)
             centers.append(center)
+        return dict(features=features, valid=masks, centers=centers)
+
+    def forward(self, coarse, coarse_valid, context, lengths):
+        # Mid-fusion prepares the detail streams once and carries them forward.
+        detail = context.get('pyramid_details')
+        if detail is None:
+            detail = self.encode_details(context, coarse_valid, lengths)
+        coarse_centers = torch.arange(coarse.shape[1], device=coarse.device).float() * self.patch_size + (self.patch_size - 1) / 2
+        features = [coarse, *detail['features']]
+        masks = [coarse_valid, *detail['valid']]
+        centers = [coarse_centers, *detail['centers']]
         memories = [(projection(h) + self.coordinate_embedding(center, lengths) + self.scale_embedding.weight[i]) * valid[..., None]
                     for i, (projection, h, center, valid) in enumerate(zip(self.memory_projection, features, centers, masks))]
         summaries = [masked_mean(h, valid) for h, valid in zip(memories, masks)]
@@ -240,20 +348,80 @@ class AttentiveStatistics(nn.Module):
         return (mean, std, weights) if return_weights else (mean, std)
 
 
+class SegmentedStatistics(nn.Module):
+    """Stable two-pass moments over equal portions of each row's valid tokens.
+
+    Segment boundaries depend on valid ranks, never the batch padding length.
+    Scatter/gather avoids materializing a B x segments x tokens x channels array.
+    """
+    def __init__(self, segments, epsilon):
+        super().__init__()
+        self.segments, self.epsilon = segments, epsilon
+
+    def forward(self, h, valid):
+        source = h.float().masked_fill(~valid[..., None], 0.)
+        b, _, d = source.shape
+        rank = (valid.long().cumsum(1) - 1).clamp_min(0)
+        segment = (rank * self.segments // valid.sum(1, keepdim=True).clamp_min(1)).clamp_max(self.segments - 1)
+        index = segment[..., None].expand(-1, -1, d)
+        count = source.new_zeros(b, self.segments).scatter_add(1, segment, valid.float())
+        divisor = count.clamp_min(1)[..., None]
+        mean = source.new_zeros(b, self.segments, d).scatter_add(1, index, source) / divisor
+        centered = (source - mean.gather(1, index)).masked_fill(~valid[..., None], 0.)
+        variance = source.new_zeros(b, self.segments, d).scatter_add(1, index, centered.square()) / divisor
+        present = count > 0
+        std = variance.clamp_min(self.epsilon).sqrt() * present[..., None]
+        return mean, std, present
+
+
+class TemporalStatisticsReadout(nn.Module):
+    """Small ordered segment encoder, added to an existing global descriptor."""
+    def __init__(self, width, projection_width, epsilon, options):
+        super().__init__()
+        d, segments, kernel = options['segment_width'], options['segments'], options['temporal_kernel']
+        self.pool = SegmentedStatistics(segments, epsilon)
+        self.projection = nn.Sequential(nn.Linear(width * 2, d), nn.LayerNorm(d), nn.GELU())
+        self.depthwise = nn.Conv1d(d, d, kernel, padding=kernel // 2, groups=d)
+        self.pointwise = nn.Linear(d, d)
+        self.dropout = nn.Dropout(options['dropout'])
+        # Flattening keeps segment order; temporal averaging would discard it.
+        self.output = nn.Sequential(nn.Linear(segments * d, projection_width), nn.LayerNorm(projection_width))
+        self.gain = nn.Parameter(torch.full((projection_width,), options['residual_scale']))
+
+    def forward(self, h, valid):
+        mean, std, present = self.pool(h, valid)
+        tokens = self.projection(torch.cat((mean, std), -1)) * present[..., None]
+        update = self.depthwise(tokens.transpose(1, 2)).transpose(1, 2) * present[..., None]
+        update = self.pointwise(F.gelu(update)) * present[..., None]
+        tokens = (tokens + self.dropout(update)) * present[..., None]
+        return self.dropout(self.output(tokens.flatten(1))) * self.gain
+
+
 class ModulationReadout(nn.Module):
-    def __init__(self, widths, classes, options):
+    def __init__(self, widths, classes, options, temporal=None):
         super().__init__()
         p = options['projection_width']
         self.pool = nn.ModuleList([AttentiveStatistics(w, options['variance_epsilon']) for w in widths])
         self.projections = nn.ModuleList([nn.Sequential(nn.Linear(w * 3, p), nn.LayerNorm(p)) for w in widths])
         self.classifier = nn.Sequential(nn.Linear(p * 3, options['modulation_hidden']), nn.GELU(),
             nn.Dropout(options['dropout']), nn.Linear(options['modulation_hidden'], classes))
+        temporal = temporal_readout_options(temporal)
+        self.temporal = None
+        if temporal['enabled']:
+            # Preserve initialization of every existing encoder/protocol/parameter
+            # tensor at a fixed seed; only the new readout consumes this RNG fork.
+            with torch.random.fork_rng(devices=[]):
+                self.temporal = nn.ModuleList([TemporalStatisticsReadout(w, p, options['variance_epsilon'], temporal)
+                                               for w in widths])
 
     def forward(self, pyramid):
         descriptors = []
-        for pool, projection, h, valid, summary in zip(self.pool, self.projections, pyramid['features'], pyramid['valid'], pyramid['summaries']):
+        for i, (pool, projection, h, valid, summary) in enumerate(zip(self.pool, self.projections, pyramid['features'], pyramid['valid'], pyramid['summaries'])):
             mean, std = pool(h, valid)
-            descriptors.append(projection(torch.cat((summary.float(), mean, std), -1)))
+            descriptor = projection(torch.cat((summary.float(), mean, std), -1))
+            if self.temporal is not None:
+                descriptor = descriptor + self.temporal[i](h, valid)
+            descriptors.append(descriptor)
         return self.classifier(torch.cat(descriptors, -1) / math.sqrt(3))
 
 

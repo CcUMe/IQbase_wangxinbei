@@ -1,0 +1,45 @@
+// P8共享基座：新P8原始词表30轮→本轮教师构词→50轮→微调20轮；默认GPU2,3。
+// 双卡DDP预训练/微调，构词仅用所选通信组的第一张卡；各阶段串行执行。
+// 模型与损失沿用三阶段正式配置，仅覆盖运行设备、批量及训练预算。
+{
+  "configs": {
+    "pretrain": "code/configs/pretrain/shared_base_p8.json5",
+    "finetune": "code/configs/finetune/shared_base_p8.json5"
+  },
+  "run": {
+    "output": "logs/shared_base_p8_dual"
+  },
+  "round1": {
+    "epochs": 30,
+    "codebook": "artifacts/structure_research_p8/codebook_v1"
+  },
+  // 继承第一轮best骨干；结构头和优化器/调度重新初始化。
+  "round2": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "backbone_lr_factor": 0.3333333333333333
+  },
+  // 每卡128×双卡=全局256，维持当前单卡配置的全局批量；不自动放大学习率。
+  // 改成256即全局512，每轮更新数与cosine总步数随之变化。
+  "data": {
+    "batch_size_per_gpu": 128
+  },
+  "codebook": {
+    "atomic_vocab": 512,
+    "max_patches": 200000,
+    "cluster_iterations": 20,
+    "cluster_chunk_size": 4096,
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "batch_size": 128,
+    "seed": 20261115,
+    "threads": 4
+  },
+  // 只允许0,1或2,3或4,5；两张卡都必须空闲。
+  "runtime": {
+    "gpu": "2,3",
+    "device": "auto",
+    "processes": 2
+  }
+}
