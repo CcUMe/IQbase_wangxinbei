@@ -1,4 +1,4 @@
-"""Supervised or self-supervised training, single GPU / torchrun DDP."""
+"""Unified config-driven supervised training, two-round pretraining and finetuning."""
 import argparse
 import math
 import hashlib
@@ -121,6 +121,7 @@ def main():
     parser.add_argument('--epochs', type=int)
     parser.add_argument('--batch-size', type=int, help='Per-process batch size')
     parser.add_argument('--merge-paired', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--background',action='store_true',help='Run in a detached Python session; print PID and log path')
     args = parser.parse_args()
     explicit_output = args.output is not None
     resolved = load_config(args.config)
@@ -204,7 +205,11 @@ def main():
         if model.multiresolution:
             raise ValueError('Multi-resolution pretraining adaptation is deferred; start supervised training without init-checkpoint')
         initial = load_checkpoint(args.init_checkpoint)
+        for key in ['dataset_fingerprint','schema','target_scaler','parameter_grids']:
+            expected=info['fingerprint'] if key=='dataset_fingerprint' else info[key]
+            if initial[key]!=expected:raise ValueError('Backbone initialization data contract mismatch: '+key)
         load_pretrained_backbone(model, initial)
+        initialization_source_steps=initial['global_step']+initial.get('initialization_source_steps',0)
     report = model.parameter_report()
     if report['final_parameters'] > 1_000_000_000 or report['shared_ratio'] <= .8:
         raise ValueError(f'Model violates contest parameter constraint: {report}')
@@ -444,7 +449,7 @@ def main():
                         with autocast(device, config['precision']):
                             if args.stage == 'pretrain':
                                 mask = patch_mask(batch['lengths'], module.config['patch_size'], config['mask_ratio'], config['mask_span'],
-                                                  seed, batch['iq'], config['mask_strategy'], config['energy_fraction'], config['energy_floor'])
+                                                  seed, batch['iq'], config['mask_strategy'], config['energy_fraction'], config['energy_floor'],config['mask_start_probability'])
                                 output = model(batch['iq'], batch['lengths'], patch_mask=mask, return_pretrain=True)
                                 loss, parts = pretraining_loss(output, batch, mask, config, codebook)
                             else:
@@ -550,5 +555,32 @@ def main():
                     '--checkpoint', str(args.output / 'best.pt'), '--output', 'weights']), flush=True)
 
 
-if __name__ == '__main__':
+def cli():
+    """One public CLI; configuration chooses workflow or one training stage."""
+    preliminary=argparse.ArgumentParser(add_help=False)
+    preliminary.add_argument('--config',type=Path)
+    preliminary.add_argument('--background',action='store_true')
+    known,_=preliminary.parse_known_args()
+    if known.background:
+        if known.config is None:preliminary.error('--config is required')
+        from utils.python_launcher import launch_background
+        launch_background(Path(__file__).resolve().parents[2]/'logs/python_launch/train')
+        return
+    if known.config is not None:
+        from utils.common import read_config_json
+        raw=read_config_json(known.config)
+        if raw.get('workflow') == 'experiment_suite':
+            from utils.experiment_suite import run_suite
+            run_suite()
+            return
+        if 'workflow' in raw or ('round1' in raw and 'round2' in raw):
+            if raw.get('workflow','two_round_pretrain')!='two_round_pretrain':
+                preliminary.error('Unsupported workflow: '+str(raw['workflow']))
+            from utils.training_workflow import run_workflow
+            run_workflow()
+            return
     main()
+
+
+if __name__ == '__main__':
+    cli()

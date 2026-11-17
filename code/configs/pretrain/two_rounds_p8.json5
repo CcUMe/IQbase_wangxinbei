@@ -1,0 +1,58 @@
+// python code/training/train.py --config code/configs/pretrain/two_rounds_p8.json5
+// 统一入口，仅两轮预训练和中间构词，不读取或启动微调。
+// P8 LR-v2：欧氏原始词表50轮→本轮教师按同一方法构词→50轮后停止，微调单独20轮。
+// 支持双卡DDP；构词仅用所选通信组的第一张卡，各阶段串行执行。
+// 模型与损失沿用三阶段正式配置，仅覆盖运行设备、批量及训练预算。
+{
+  "workflow": "two_round_pretrain",
+  "configs": {
+    "pretrain": "code/configs/pretrain/shared_base_p8.json5"
+  },
+  "run": {
+    "output": "logs/shared_base_p8_lr_v2"
+  },
+  // 第一轮LR来自configs.pretrain：骨干/结构头均6e-4，10%warmup+cosine。
+  "round1": {
+    "epochs": 50,
+    "codebook": "artifacts/structure_research_p8_euclidean/codebook_v1"
+  },
+  // 继承第一轮best骨干；结构头/优化器/调度重置；骨干3e-4、结构头6e-4。
+  // 调度继承单轮模板：本轮总更新数的10%warmup，再cosine至峰值5%。
+  "round2": {
+    "epochs": 50,
+    "learning_rate": 0.0006,
+    "backbone_lr_factor": 0.5
+  },
+  // batch为每卡批量；当前双卡256对应全局512，不自动放大学习率。
+  // 双卡每卡改为128可维持全局256；保留用户当前选择，不自动修改。
+  // 全局批量变化时，每轮更新数与cosine总步数随之变化。
+  "data": {
+    "batch_size_per_gpu": 256
+  },
+  "codebook": {
+    "atomic_vocab": 512,
+    "max_patches": 200000,
+    "cluster_iterations": 20,
+    "cluster_chunk_size": 4096,
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "batch_size": 128,
+    "seed": 20261115,
+    "threads": 4,
+    // 必须与round1.codebook元数据一致，并传给第二轮教师词表构建。
+    "metric": "euclidean",
+    "normalization": "rms",
+    "amplitude_percentile": 99.0,
+    "cluster_batch_size": 16384,
+    "cluster_initializations": 5,
+    "bpe_tokens": 0,
+    "min_frequency": 20
+  },
+  // 当前保留用户选择的2,3双卡；仅允许0,1或2,3或4,5通信组，允许GPU共享。
+  "runtime": {
+    "gpu": "2,3",
+    "device": "auto",
+    "processes": 2
+  }
+}

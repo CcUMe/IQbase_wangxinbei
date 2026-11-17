@@ -1,5 +1,5 @@
 // P8正式入口：三阶段共用相同骨干；预训练随机连续遮蔽跨度8，最终比例30%。
-// 正式入口：code/training/train.py；与其他两阶段保持同一骨干。
+// 正式入口：code/training/train.py；独立第一轮与两轮流程使用同一欧氏原始词表。
 {
   // 统一训练配置版本。
   "schema_version": 2,
@@ -7,14 +7,14 @@
   // 三个正式入口共用同一共享骨干。
   "experiment": {
     "name": "pretrain_shared_base_p8",
-    "description": "第一轮：统一768×12、P8共享基座，原始I/Q词表预训练30轮；迭代流程随后用本轮模型重建词表。"
+    "description": "P8 LR-v2第一轮模板：768×12共享基座，50轮、峰值6e-4、10%warmup；两轮流程覆盖词表路径并随后用本轮模型重新构词。"
   },
 
   // 从仓库根目录启动；输出自动追加时间戳。
   "run": {
     "data": "artifacts/data_full_p8",
-    "output": "logs/pretrain_shared_base_p8",
-    "codebook": "artifacts/structure_research_p8/codebook_v1",
+    "output": "logs/pretrain_shared_base_p8_lr_v2",
+    "codebook": "artifacts/structure_research_p8_euclidean/codebook_v1",
     "init_checkpoint": "",
     "warmstart_checkpoint": ""
   },
@@ -116,7 +116,7 @@
   // max_steps仅是停止上限，不缩短完整cosine周期。
   "training": {
     "stage": "pretrain",
-    "epochs": 30,
+    "epochs": 50,
     "max_steps": 0,
     "gradient_accumulation_steps": 1,
     "gradient_clip": 1.0
@@ -135,10 +135,10 @@
     "validate_stage_boundaries": false
   },
 
-  // 微调时基座LR小于随机任务头；有监督从头训练和预训练不缩小基座LR。
+  // LR-v2第一轮：骨干与结构头峰值均6e-4；第二轮由两轮流程覆盖为3e-4/6e-4。
   "optimizer": {
     "name": "adamw",
-    "learning_rate": 0.0003,
+    "learning_rate": 0.0006,
     "backbone_lr_factor": 1.0,
     "weight_decay": 0.01,
     "betas": [
@@ -150,11 +150,11 @@
     "skip_inactive_heads": true
   },
 
-  // 3%线性warmup后cosine。
+  // 两轮预训练均10%线性warmup后cosine，到各组峰值的5%；单独微调仍3%warmup。
   "scheduler": {
     "name": "cosine",
     "warmup_steps": 0,
-    "warmup_ratio": 0.03,
+    "warmup_ratio": 0.1,
     "warmup_start_factor": 0.0,
     "min_lr_ratio": 0.05
   },

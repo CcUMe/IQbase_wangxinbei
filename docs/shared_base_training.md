@@ -53,94 +53,17 @@ CUDA_VISIBLE_DEVICES=0 python code/training/train.py --config code/configs/pretr
 CUDA_VISIBLE_DEVICES=0 python code/training/train.py --config code/configs/finetune/shared_base.json5
 ```
 
-手动微调默认读取独立预训练输出`logs/pretrain_shared_base`的对应运行；若要微调迭代流程的第二轮，请用`--init-checkpoint <本流程/pretrain_round2/时间戳/best.pt>`明确指定。自动流程不使用全局指针，而是绑定本流程第二轮的精确best.pt。
+手动微调默认读取独立预训练输出`logs/pretrain_shared_base`的对应运行；若要微调迭代流程的第二轮，请用`--init-checkpoint <本流程/pretrain_round2/时间戳/best.pt>`明确指定。指定流程目录时会解析该流程已完成第二轮的精确best.pt。
 
-## 当前自动迭代流程：30轮→新模型构词→50轮→微调
+## 配置驱动的两轮预训练与独立微调
 
-```bash
-bash code/training/run_iterative_pretrain.sh
+现统一使用 `python code/training/train.py --config ...`，两轮预训练完成后停止，微调单独启动。专用Python及bash启动器已移除。P16历史流程配置可交给统一入口执行预训练：
+
+```text
+python code/training/train.py --config code/configs/pipeline/shared_base_iterative.json5
+python code/training/train.py --config code/configs/finetune/shared_base.json5
 ```
 
-默认物理GPU0、单进程，所有阶段串行。需要另一张已分配单卡时可设`C01_GPU=1`；新流程会检查该卡是否已有计算进程，非空则拒绝新启动，不会自行结束其他任务。Python默认本项目py313，可用`C01_PYTHON`指定解释器。
+微调前在其配置的 `run.init_checkpoint` 指定所需P16第二轮流程或精确`.pt`，避免使用其他单轮结果。旧流程配置中的`configs.finetune`不参与两轮预训练。
 
-脚本后台执行，关闭终端不影响运行。集中配置为`code/configs/pipeline/shared_base_iterative.json5`，包含预算、构词和运行参数，不复制多套完整模型配置。
-
-| 顺序 | 输入/初始化 | 训练或操作 | 输出 |
-| --- | --- | --- | --- |
-| 第一轮 | 当前新架构随机初始化＋原始I/Q的v1词表 | 预训练30轮；峰值LR3e-4 | 本轮结构验证损失最佳的best.pt |
-| 重建词表 | 冻结本流程第一轮best.pt提取完整输入特征 | 仅训练集拟合512原子聚类与最多512次BPE合并；全数据固定赋标签 | 新建本流程独立词表，不覆盖v1/v2 |
-| 第二轮 | 第一轮完整共享backbone＋新词表 | 预训练50轮；新结构头峰值3e-4，骨干1e-4 | 本轮结构验证损失最佳的best.pt |
-| 微调 | 第二轮共享backbone＋随机三任务头 | 20轮；任务头3e-4，骨干3e-5 | 按调制准确率选择的best.pt |
-| 导出 | 微调best.pt | 删除辅助训练头、校验权重往返 | exported_model单模型 |
-
-第一轮严格使用原始I/Q构建的词表，不加载旧模型；第二轮继承第一轮骨干，包括已学习的iq_geometry。新词表即便仍为512/1024类，类别编号语义已改变，所以结构预测头必须随机重建；不能使用全模型warmstart。切换阶段时优化器和3%warmup+cosine调度器也重新创建；只有恢复同一中断阶段时才保留优化器与调度进度。预训练重建损失权重始终为0。两轮合计80轮是当前默认预算，不是已验证最优分配。
-
-构词默认抽取约200000个训练patch用于聚类，20次聚类迭代；最多20000条去重训练序列拟合BPE，组合跨度最多5。第一轮教师只在离线构词时使用，第二轮与微调不保留在线教师，也不引入推理依赖。验证集不参与聚类中心和BPE规则拟合。训练单卡batch256、无梯度累积；构词batch128。
-
-每次建立`logs/shared_base_iterative/<时间戳>/`，保存：
-
-- 冻结源码、pipeline_config.json、pretrain_round1_config.json、codebook_round2_config.json、pretrain_round2_config.json、finetune_config.json；各阶段使用同一源码快照，后续修改仓库不影响运行；
-- `pipeline.pid`、`status.json`、`manifest.json`，后者记录精确阶段运行目录及checkpoint；
-- `pretrain_round1_console.log`、`codebook_round2_console.log`、`pretrain_round2_console.log`、`finetune_console.log`；训练阶段目录内另有可读train.log、JSONL、TensorBoard和每1000步last.pt；
-- `codebooks/round2_<时间戳>/`保存本次新词表；manifest记录第一轮教师精确路径及SHA256，防止混入历史教师；
-- 前一阶段完整成功后才进入后一阶段；微调结束后导出单模型到`exported_model/`。
-
-若阶段失败，会记录failed及错误，不会加载无关旧权重继续下一阶段。最后写`completion.json`。原weights目录不覆盖。
-
-## 查看与恢复
-
-`logs/shared_base_iterative/latest_pipeline.json`给出最近创建的流程目录。直接查看其中`status.json`和当前阶段console.log即可。
-
-```bash
-bash code/training/run_iterative_pretrain.sh --resume logs/shared_base_iterative/<流程时间戳>
-```
-
-恢复检查冻结源码SHA256，使用冻结配置及当前训练阶段last.pt；已完成阶段跳过。保留原优化器和cosine进度。若离线构词中断，已写出完整codebook.json的词表会校验后复用，否则在新attempt目录重新构建，保留半成品。停止时可向pipeline.pid发送SIGTERM，协调程序只停止自己的子进程并等待其释放GPU；训练从最近已保存断点恢复，不额外承诺保存中断瞬间状态。
-
-旧`run_pretrain_finetune.sh`两阶段脚本及旧流水线快照保留，原来已经启动的80轮/v2训练不会被配置文件修改自动改变；新实验应使用本节迭代入口。
-
-## 单卡与双卡切换
-
-`train.py`本身支持双卡DDP，三阶段正式训练配置均可只调整`runtime.gpus`和`runtime.processes`：单卡为`"gpus":"0", "processes":1`；双卡为`"gpus":"0,1", "processes":2`。只支持通信组0,1或2,3或4,5，不支持跨组组合。也可在单次命令覆盖：
-
-```bash
-# 双卡第一轮预训练；微调时换成finetune配置并明确指定对应预训练检查点。
-python code/training/train.py --config code/configs/pretrain/shared_base.json5 --gpus 0,1 --processes 2
-# 单卡。
-python code/training/train.py --config code/configs/pretrain/shared_base.json5 --gpus 0 --processes 1
-```
-
-batch_size是每进程/每卡批量，梯度累计为1时，单卡256对应全局256、双卡256对应全局512；如需维持全局256，双卡将data.batch_size改为128。改变卡数/批量会改变每轮更新数和cosine总步数；不能把单卡中断checkpoint按双卡resume，切换需新训练流程。
-
-以上命令适用于直接运行train.py。迭代pipeline会按自身流程配置覆盖训练模板的runtime，所以切换完整一键流程应使用下方双卡入口及对应pipeline配置。旧两阶段pipeline仍限制单卡；构词保持单进程。
-
-## 双卡一键迭代入口
-
-```bash
-# 默认0,1，确认两张卡都空闲后启动。
-bash code/training/run_iterative_pretrain_dual.sh
-
-# 选择另一组已分配的空闲通信卡组。
-C01_GPUS=2,3 bash code/training/run_iterative_pretrain_dual.sh
-# 等价CLI覆盖：
-bash code/training/run_iterative_pretrain_dual.sh --gpus 4,5
-```
-
-独立配置为`code/configs/pipeline/shared_base_iterative_dual.json5`。第一轮30轮→构词→第二轮50轮→微调20轮→导出保持不变。两轮预训练和微调的`runtime.processes=2`，通过现有train.py启动torchrun/DDP；构词使用所选组的第一张物理卡，例如2,3组只在GPU2构词，另一张卡此阶段不承载本流程训练。导出使用CPU。每阶段完成并退出后才启动下一阶段，不同时启动多项训练。
-
-`data.batch_size_per_gpu=128`覆盖三项训练阶段的每卡批量，全局batch=128×2×累计1=256，与当前单卡保持一致；学习率不自动放大，3%warmup和cosine依据实际总更新数计算。构词batch独立为128。若希望全局512，将这个配置项改成256后新建流程；不能改正在运行或恢复中的冻结配置。
-
-启动会检查所选两张卡的计算进程，任一卡忙则报错，不结束其他任务。默认双卡组0,1当前若已被其他训练占用，应等待其结束或选择自己已分配且空闲的2,3或4,5组。启动只创建新实验，不会自动停止或转换已有单卡流程。
-
-输出为`logs/shared_base_iterative_dual/<时间戳>/`，目录结构、TensorBoard、best/last、词表教师绑定、源码快照与单卡一致。`latest_pipeline.json`给出最新流程，`status.json`记录当前阶段、子进程PID和阶段进程数。后台脚本的启动日志位于该根目录的launch/。停止时向pipeline.pid发送SIGTERM，会向当前阶段的整个进程组转发停止信号，涵盖torchrun和两个worker。
-
-```bash
-bash code/training/run_iterative_pretrain_dual.sh \
-  --resume logs/shared_base_iterative_dual/<流程时间戳>
-```
-
-恢复自动使用冻结卡组，不需要再次传C01_GPUS；若显式指定则必须与原组一致。已完成阶段跳过，训练阶段恢复last.pt及原优化器/调度；不能将当前单卡流程直接交给双卡入口resume。单卡入口`run_iterative_pretrain.sh`及其旧配置继续可用。
-
-双进程执行检查可在CPU运行`python code/training/test_iterative_pipeline.py --processes 2`：使用真实小缓存、Gloo双进程完成两轮训练、单进程构词、微调、导出和统一推理；该检查不代表NCCL性能、正式准确率或双卡加速比。
-
-验证证据位于`artifacts/shared_base_pipeline/`：模块相位性质、有限梯度、预训练掩码泄漏、迁移和原生长度零残差一致性检查；真实小缓存完成有监督、预训练、微调、源码冻结自动串联、导出及12条三任务推理。小缓存分数仅用于执行检查，不是准确率收益证据。
+两轮流程仍冻结代码及实际配置，第一轮30轮→用本轮最佳骨干重建词表→继承骨干第二轮50轮；结构头、优化器及cosine重新初始化。恢复保留当前轮状态，构词只占第一张卡。详细参数、日志和恢复规则见[统一训练说明](unified_training.md)。历史权重、日志及运行快照保留。

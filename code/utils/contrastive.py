@@ -46,6 +46,11 @@ def supervised_contrastive(embedding, labels, rows, temperature=.1, gather=True)
 
 def load_with_training_aux(model, state, source_config=None):
     """Warmstart auxiliary changes and add zero-weight std columns to old classifiers."""
+    if source_config is not None:
+        for key,default in [('normalization','rms'),('amplitude_percentile',99.),
+                            ('gate_input_normalization',False)]:
+            if source_config.get(key,default)!=model.config.get(key,default):
+                raise ValueError('Warmstart cannot silently change '+key)
     source_pyramid = (source_config or {}).get('pyramid', {}).get('enabled', False)
     source_hierarchy = (source_config or {}).get('hierarchy', {}).get('enabled', False)
     source_hybrid = (source_config or {}).get('hybrid', {}).get('enabled', False)

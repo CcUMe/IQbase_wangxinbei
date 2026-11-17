@@ -10,9 +10,9 @@ def load_pretrained_backbone(model,checkpoint):
     old=checkpoint['model_config'];new=model.config
     defaults=dict(width=384,depth=8,heads=6,patch_size=16,stft_window=64,
         mlp_ratio=4.,phase_features=False,position='samples',rope_base=10000.,
-        qk_normalization=False,qk_scale=1.,normalize_fusion=False,rms_epsilon=1e-6,
+        qk_normalization=False,qk_scale=1.,normalize_fusion=False,gate_input_normalization=False,rms_epsilon=1e-6,
         global_spectrum=True,scale_embedding=True,global_spectrum_input=True,
-        frontend='time_frequency',normalization='rms',amplitude_percentile=99.)
+        normalization='rms',amplitude_percentile=99.)
     for key,default in defaults.items():
         if old.get(key,default)!=new.get(key,default):
             raise ValueError('Pretrained backbone config mismatch: '+key)

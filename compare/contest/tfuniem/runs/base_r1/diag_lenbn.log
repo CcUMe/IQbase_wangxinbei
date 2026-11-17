@@ -1,0 +1,51 @@
+dumped outputs (35s)
+BN check {
+ "eval_mode_bn": {
+  "proxy_score": 77.26189721126221,
+  "protocol_accuracy": 0.9537592171456136,
+  "modulation_accuracy": 0.6518553986114436,
+  "parameter_proxy": 0.7273364684637625
+ },
+ "train_mode_bn": {
+  "proxy_score": 75.9531629174554,
+  "protocol_accuracy": 0.9356350354903177,
+  "modulation_accuracy": 0.6295427340196313,
+  "parameter_proxy": 0.7249457458039232
+ },
+ "rmse_eval": {
+  "symbol_rate": 194.30473229905414,
+  "bandwidth": 253.10439688469972,
+  "frequency_shift": 12.855220471491116,
+  "pulse_width": 1.0125501676674078e-06,
+  "pri": 7.85015622521807e-07,
+  "time_delay": 1.1893078374958943e-06,
+  "number_of_pulses": 0.6319594219082126
+ },
+ "rmse_train_bn": {
+  "symbol_rate": 198.2700194000986,
+  "bandwidth": 258.8615439555541,
+  "frequency_shift": 19.723861320465158,
+  "pulse_width": 1.0138698978693708e-06,
+  "pri": 7.851463324822902e-07,
+  "time_delay": 1.1892479724636374e-06,
+  "number_of_pulses": 0.6323223998121362
+ }
+}
+throughput {
+ "unfused_fp32_L512_bs1": 90,
+ "unfused_fp32_L512_bs1024": 8040,
+ "unfused_fp32_L1024_bs1": 89,
+ "unfused_fp32_L1024_bs1024": 4366,
+ "unfused_bf16_L512_bs1": 71,
+ "unfused_bf16_L512_bs1024": 24908,
+ "unfused_bf16_L1024_bs1": 72,
+ "unfused_bf16_L1024_bs1024": 13838,
+ "fused_fp32_L512_bs1": 118,
+ "fused_fp32_L512_bs1024": 10968,
+ "fused_fp32_L1024_bs1": 117,
+ "fused_fp32_L1024_bs1024": 5752,
+ "fused_bf16_L512_bs1": 98,
+ "fused_bf16_L512_bs1024": 33196,
+ "fused_bf16_L1024_bs1": 97,
+ "fused_bf16_L1024_bs1024": 17377
+}

@@ -1,4 +1,4 @@
-# P8共享基座：双卡迭代预训练与微调
+# P8共享基座：配置驱动预训练与独立微调
 
 2026-11-15新增候选。它把整个共享时频骨干的patch步长从16改为8，不增加P8旁路或第二个编码器。768维、12层、6注意力头、64点局部功率谱窗、I/Q几何残差和三任务头保留。512/1024点输入分别产生64/128个有效token。三阶段均使用同一骨干和输入语义。
 
@@ -11,9 +11,9 @@
 | 从头有监督 | code/configs/supervised/shared_base_p8.json5 |
 | 第一轮结构预训练 | code/configs/pretrain/shared_base_p8.json5 |
 | 预训练基座微调 | code/configs/finetune/shared_base_p8.json5 |
-| 完整双卡迭代流程 | code/configs/pipeline/shared_base_iterative_p8_dual.json5 |
+| 两轮预训练 | code/configs/pretrain/two_rounds_p8.json5 |
 
-第一轮原始I/Q词表预训练30轮→本轮最佳P8模型重建词表→继承P8骨干预训练50轮、重新初始化结构头→全参微调20轮→导出。双卡默认物理GPU2,3，每卡128，全局batch256，梯度累计1。重建词表时只用GPU2；导出用CPU。学习率和cosine沿用P16迭代方案。
+第一轮原始I/Q欧氏词表预训练50轮→本轮最佳P8模型重建词表→继承P8骨干预训练50轮后停止，结构头重新初始化。微调由独立配置加载第二轮骨干，全参20轮。LR-v2两轮入口保留用户当前GPU2,3、每卡256；微调默认单卡GPU0、batch256。历史运行保持各自冻结配置。
 
 ## 一次性准备P8缓存与首轮词表
 
@@ -30,21 +30,12 @@ P8数据视图通过链接读取原iq.npy、metadata.npz和split_manifest.parque
 
 ## 启动与恢复
 
-```bash
-bash code/training/run_iterative_pretrain_p8_dual.sh
-
-# 已完成一次准备后，也可直接交给通用双卡入口：
-bash code/training/run_iterative_pretrain_dual.sh \
-  --config code/configs/pipeline/shared_base_iterative_p8_dual.json5
-
-# 恢复本P8流程，不能填写P16流程目录：
-bash code/training/run_iterative_pretrain_p8_dual.sh \
-  --resume logs/shared_base_p8_dual/<时间戳>
+```text
+python code/training/train.py --config code/configs/pretrain/two_rounds_p8.json5
+python code/training/train.py --config code/configs/finetune/shared_base_p8.json5
 ```
 
-输出为logs/shared_base_p8_dual/<时间戳>/，含源码快照、各阶段实际配置、console日志、TensorBoard、last/best、第二轮词表和导出模型。启动日志由通用双卡launcher写入logs/shared_base_iterative_dual/launch/；实际P8运行目录由logs/shared_base_p8_dual/latest_pipeline.json指向。所选卡组忙时拒绝启动，不自动终止其他任务。
-
-三个正式配置也能直接交给train.py单阶段运行；微调需用--init-checkpoint明确指定对应P8检查点。P16与P8前端权重尺寸和位置契约不同，当前不允许直接完整迁移或resume；这次第一轮从随机初始化开始。P16配置、词表、权重与日志保留。
+两项训练独立启动，预训练不自动微调。配置参数、精确权重选择、日志及恢复方式见[统一训练说明](unified_training.md)。重复专用入口已移除；历史实验配置和训练快照保留。
 
 ## 检查范围
 

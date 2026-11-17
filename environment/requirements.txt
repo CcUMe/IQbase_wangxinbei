@@ -3,3 +3,4 @@ numpy>=1.26
 pyarrow>=19.0.1
 tqdm>=4.66
 tensorboard>=2.18,<3
+scikit-learn>=1.6

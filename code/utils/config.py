@@ -24,8 +24,9 @@ DEFAULTS = {
                     'dropout': 0.1, 'attention_dropout': 0.1, 'rope_base': 10000.0, 'qk_normalization': False, 'qk_scale': 1.0},
         'signal': {'patch_size': 16, 'stft_window': 64, 'phase_features': False,
                    'global_spectrum': True, 'spectral_backend': 'fft',
-                   'position': 'samples', 'rms_epsilon': 1e-6, 'normalize_fusion': False, 'local_refinement': False,
-                   'frontend': 'time_frequency', 'normalization': 'rms', 'amplitude_percentile': 99.0,
+                   'position': 'samples', 'rms_epsilon': 1e-6, 'normalize_fusion': False,
+                   'gate_input_normalization': False, 'local_refinement': False,
+                   'normalization': 'rms', 'amplitude_percentile': 99.0,
                    'position_options': deepcopy(POSITION_DEFAULTS),
                    'scale_embedding': True, 'global_spectrum_input': True, 'multiscale_frontend': False},
         'heads': {'parameter_mode': 'regression', 'classification_hidden_ratio': 0.5,
@@ -245,11 +246,7 @@ def validate_config(c):
     require(512 % m['patch_size'] == 0 and m['stft_window'] >= m['patch_size'] and (m['stft_window'] - m['patch_size']) % 2 == 0,
             'Patch must divide 512; STFT and patch centers must align')
     require(m['position'] in ['samples', 'window', 'dual', 'physical', 'rope_fs'], 'Unknown position mode')
-    require(m['frontend'] in ['time_frequency','linear_iq'], 'Unknown frontend')
     require(m['normalization'] in ['rms','amplitude_percentile'] and math.isfinite(m['amplitude_percentile']) and 0<m['amplitude_percentile']<=100, 'Invalid signal normalization')
-    if m['frontend']=='linear_iq':
-        require(not any(c['model'][k]['enabled'] for k in ['pyramid','hierarchy','hybrid','iq_geometry','patch_shift','density_encoding','phase_relations']), 'linear_iq uses one patch encoder without experimental frontend adapters')
-        require(not any(m[k] for k in ['phase_features','global_spectrum','scale_embedding','global_spectrum_input','local_refinement','multiscale_frontend']) and not m['position_options']['absolute_features'], 'linear_iq requires only IQ patches and rotary positions, without extra input paths')
     position = m['position_options']
     require(position['reference_length'] > 0, 'position_options.reference_length must be positive')
     require(0 < position['window_head_fraction'] < 1, 'window_head_fraction must be in (0,1)')

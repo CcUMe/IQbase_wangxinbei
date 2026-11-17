@@ -33,14 +33,41 @@ def command_defaults(parser, mapping, argv=None):
 
 
 def checkpoint_reference(value):
-    """Accept an exact checkpoint or a timestamped output parent (latest/best.pt)."""
+    """Resolve exact weights, completed two-round workflows, or a run parent.
+
+    Pending round2 is never silently replaced with round1. Follow completion
+    pointers before active-workflow pointers, and reject cyclic pointers.
+    """
+    from utils.common import read_json
     from utils.run_directory import latest_run
-    path = Path(value).expanduser().resolve()
-    if path.is_dir():
-        path = path / 'best.pt' if (path / 'best.pt').is_file() else latest_run(path) / 'best.pt'
-    if not path.is_file():
-        raise ValueError(f'Checkpoint does not exist: {path}')
-    return path
+    visited=set()
+    def resolve(reference):
+        path=Path(reference).expanduser().resolve()
+        if path in visited:raise ValueError('Cyclic checkpoint reference: '+str(path))
+        visited.add(path)
+        if path.is_file():return path
+        if (path/'best.pt').is_file():return path/'best.pt'
+        if (path/'manifest.json').is_file():
+            stages=read_json(path/'manifest.json')['stages']
+            name='finetune' if 'finetune' in stages else 'pretrain_round2'
+            stage=stages.get(name,{})
+            if not stage.get('complete'):
+                raise ValueError('流程尚未完成 '+name+'；如需中间权重，请显式指定对应.pt文件：'+str(path))
+            checkpoint=Path(stage['best_checkpoint']).expanduser().resolve()
+            if not checkpoint.is_file():raise ValueError('Checkpoint does not exist: '+str(checkpoint))
+            return checkpoint
+        for name in ['latest_pretrained.json','latest_pipeline.json']:
+            if (path/name).is_file():
+                pointer=read_json(path/name)
+                checkpoint=resolve(pointer['pipeline_directory'])
+                if name=='latest_pretrained.json' and checkpoint!=Path(pointer['checkpoint']).resolve():
+                    raise ValueError('Completed-pretraining pointer does not match its pipeline')
+                return checkpoint
+        try:checkpoint=latest_run(path)/'best.pt'
+        except FileNotFoundError:raise ValueError('Checkpoint does not exist: '+str(path)) from None
+        if not checkpoint.is_file():raise ValueError('Checkpoint does not exist: '+str(checkpoint))
+        return checkpoint
+    return resolve(value)
 
 
 def configured_launch(gpus='', processes=1, device='auto', distributed=False):

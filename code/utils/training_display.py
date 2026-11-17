@@ -125,8 +125,11 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
         pretrain = settings['loss']['pretraining']
         weights = pretrain['weights']
         active = {k: v for k, v in weights.items() if v > 0 and (codebook or k not in ['atomic', 'emergent'])}
-        lines.append(f"预训练目标 : {active} | mask={pretrain['mask']['ratio']:.0%}"
+        mode=(f"start_probability={pretrain['mask']['start_probability']:.2%}（最终比例不固定）"
+              if pretrain['mask']['strategy']=='bernoulli_starts' else f"mask={pretrain['mask']['ratio']:.0%}")
+        lines.append(f"预训练目标 : {active} | {mode}"
                      f" span={pretrain['mask']['span']} strategy={pretrain['mask']['strategy']}")
+        lines.append(f"输入尺度   : {model['signal'].get('normalization','rms')} | 结构损失归约={pretrain.get('reduction','per_record')}")
         if codebook:
             lines.append(f"结构词表   : Atomic={codebook['atomic_vocab']} | Emergent={codebook['emergent_vocab']}")
     else:

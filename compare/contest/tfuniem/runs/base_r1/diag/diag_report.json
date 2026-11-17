@@ -1,0 +1,55 @@
+{
+ "ckpt": "runs/base_r1/best.pt",
+ "epoch": 9,
+ "bn_check": {
+  "eval_mode_bn": {
+   "proxy_score": 74.4574761734804,
+   "protocol_accuracy": 0.9354282957756185,
+   "modulation_accuracy": 0.6135025137658606,
+   "parameter_proxy": 0.6997387971809009
+  },
+  "train_mode_bn": {
+   "proxy_score": 75.9531629174554,
+   "protocol_accuracy": 0.9356350354903177,
+   "modulation_accuracy": 0.6295427340196313,
+   "parameter_proxy": 0.7249457458039232
+  },
+  "rmse_eval": {
+   "symbol_rate": 208.65305951168602,
+   "bandwidth": 272.93493409816557,
+   "frequency_shift": 37.64164248134006,
+   "pulse_width": 1.1507698105354047e-06,
+   "pri": 9.6453921762432e-07,
+   "time_delay": 1.3201162172822986e-06,
+   "number_of_pulses": 0.6830558770008205
+  },
+  "rmse_train_bn": {
+   "symbol_rate": 198.2700194000986,
+   "bandwidth": 258.8615439555541,
+   "frequency_shift": 19.723861320465158,
+   "pulse_width": 1.0138698978693708e-06,
+   "pri": 7.851463324822902e-07,
+   "time_delay": 1.1892479724636374e-06,
+   "number_of_pulses": 0.6323223998121362
+  }
+ },
+ "throughput_samples_per_s": {
+  "unfused_fp32_L512_bs1": 92.46741691239635,
+  "unfused_fp32_L512_bs1024": 7763.661550223108,
+  "unfused_fp32_L1024_bs1": 92.87305235920091,
+  "unfused_fp32_L1024_bs1024": 4218.763351701874,
+  "unfused_bf16_L512_bs1": 72.6185181113282,
+  "unfused_bf16_L512_bs1024": 23912.451899602198,
+  "unfused_bf16_L1024_bs1": 72.97556209206503,
+  "unfused_bf16_L1024_bs1024": 13253.14312022405,
+  "fused_fp32_L512_bs1": 120.96529306217423,
+  "fused_fp32_L512_bs1024": 10582.222886553436,
+  "fused_fp32_L1024_bs1": 120.10349226993608,
+  "fused_fp32_L1024_bs1024": 5535.074073902243,
+  "fused_bf16_L512_bs1": 96.69872932462309,
+  "fused_bf16_L512_bs1024": 31710.702395560616,
+  "fused_bf16_L1024_bs1": 99.82737351891215,
+  "fused_bf16_L1024_bs1024": 16645.026745926105
+ },
+ "gpu": "NVIDIA A100-SXM4-80GB"
+}

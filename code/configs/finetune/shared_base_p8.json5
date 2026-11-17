@@ -1,5 +1,5 @@
 // P8正式入口：三阶段共用相同骨干；预训练随机连续遮蔽跨度8，最终比例30%。
-// 正式入口：code/training/train.py；与其他两阶段保持同一骨干。
+// 统一入口：python code/training/train.py --config code/configs/finetune/shared_base_p8.json5
 {
   // 统一训练配置版本。
   "schema_version": 2,
@@ -7,15 +7,15 @@
   // 三个正式入口共用同一共享骨干。
   "experiment": {
     "name": "finetune_shared_base_p8",
-    "description": "finetune：统一768×12、P8共享时频基座；相位增强只用于监督阶段。"
+    "description": "P8 LR-v2独立微调：全参20轮，骨干1e-4/任务头3e-4，WD0.08，3%warmup与cosine。"
   },
 
   // 从仓库根目录启动；输出自动追加时间戳。
   "run": {
     "data": "artifacts/data_full_p8",
-    "output": "logs/finetune_shared_base_p8",
+    "output": "logs/finetune_shared_base_p8_lr_v2",
     "codebook": "",
-    "init_checkpoint": "logs/pretrain_shared_base_p8",
+    "init_checkpoint": "logs/shared_base_p8_lr_v2/20261116_132341_818567/pretrain_round2/20261117_053616_110466/best.pt",
     "warmstart_checkpoint": ""
   },
 
@@ -83,7 +83,7 @@
     }
   },
 
-  // 单卡batch；监督/微调仅对前14类纯调制记录做相位增强。
+  // 默认单卡batch256；仅前14类纯调制记录做相位增强。
   "data": {
     "batch_size": 256,
     "steps_per_epoch": 0,
@@ -150,12 +150,12 @@
     "validate_stage_boundaries": false
   },
 
-  // 微调时基座LR小于随机任务头；有监督从头训练和预训练不缩小基座LR。
+  // LR-v2微调：骨干峰值1e-4、任务头3e-4，全参20轮；AdamW权重衰减0.08。
   "optimizer": {
     "name": "adamw",
     "learning_rate": 0.0003,
-    "backbone_lr_factor": 0.1,
-    "weight_decay": 0.01,
+    "backbone_lr_factor": 0.3333333333333333,
+    "weight_decay": 0.08,
     "betas": [
       0.9,
       0.999
@@ -249,10 +249,10 @@
     "save_every_epochs": 0
   },
 
-  // 单进程单GPU，BF16；正式流程脚本会覆盖物理GPU编号。
+  // 默认物理GPU0单卡、BF16；双卡时设gpus="2,3"、processes=2并将每卡batch改为128。
   "runtime": {
     "device": "auto",
-    "gpus": "0",
+    "gpus": "3",
     "processes": 1,
     "precision": "bf16",
     "seed": 20261115,

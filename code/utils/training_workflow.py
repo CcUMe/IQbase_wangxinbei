@@ -1,4 +1,4 @@
-"""Round1 -> new-teacher vocabulary -> round2 -> finetune -> export.
+"""Internal two-round workflow used by the unified training CLI.
 
 One or two GPUs train; vocabulary building uses only the first selected GPU.
 Only backbone weights transfer across objectives/vocabularies. Each training
@@ -25,18 +25,18 @@ sys.path.insert(0, str(ROOT / 'code'))
 import numpy as np
 import torch
 from utils.common import read_config_json, read_json, write_json
-from utils.config import model_options, validate_config
+from utils.config import load_config, model_options, validate_config
 from utils.run_directory import latest_run
-from training.pretrain_finetune_pipeline import prepare_configs
 
-DEFAULT_CONFIG = ROOT / 'code/configs/pipeline/shared_base_iterative.json5'
+CODEBOOK_METHOD_DEFAULTS={'metric':'spherical','normalization':'rms','amplitude_percentile':99.,
+    'cluster_batch_size':16384,'cluster_initializations':5,'bpe_tokens':0,'min_frequency':1}
 FIELDS = {
     'configs': {'pretrain', 'finetune'}, 'run': {'output'},
     'round1': {'epochs', 'codebook'},
     'round2': {'epochs', 'learning_rate', 'backbone_lr_factor'},
     'codebook': {'atomic_vocab', 'max_patches', 'cluster_iterations',
                  'cluster_chunk_size', 'merges', 'max_span', 'fit_sequences',
-                 'batch_size', 'seed', 'threads'},
+                 'batch_size', 'seed', 'threads',*CODEBOOK_METHOD_DEFAULTS},
     'runtime': {'gpu', 'device', 'processes'},
     'data': {'batch_size_per_gpu'},
 }
@@ -65,13 +65,19 @@ def digest(path):
 
 def read_settings(path):
     settings = read_config_json(path)
+    workflow=settings.pop('workflow','two_round_pretrain')
+    if workflow!='two_round_pretrain':raise ValueError('Unknown workflow: '+str(workflow))
     # Backward compatible with original single-GPU pipeline configurations.
     if isinstance(settings.get('runtime'), dict):
         settings['runtime'].setdefault('processes', 1)
     settings.setdefault('data', {'batch_size_per_gpu': 0})
+    if isinstance(settings.get('codebook'),dict):
+        for key,value in CODEBOOK_METHOD_DEFAULTS.items():settings['codebook'].setdefault(key,value)
     if set(settings) != set(FIELDS):
         raise ValueError('Pipeline config groups must be: ' + ', '.join(FIELDS))
     for group, names in FIELDS.items():
+        if group=='configs' and isinstance(settings[group],dict):
+            names={'pretrain'} if 'finetune' not in settings[group] else names
         if not isinstance(settings[group], dict) or set(settings[group]) != names:
             raise ValueError(f'Invalid {group} fields; expected {sorted(names)}')
     for group in ['round1', 'round2']:
@@ -82,9 +88,12 @@ def read_settings(path):
         if not isinstance(value, (float, int)) or not math.isfinite(value) or value <= 0:
             raise ValueError('round2.' + name + ' must be positive and finite')
     for name, value in settings['codebook'].items():
-        if type(value) is not int or value < (0 if name in ['merges', 'seed'] else 1):
+        if name in ['metric','normalization','amplitude_percentile']:continue
+        if type(value) is not int or value < (0 if name in ['merges', 'seed','bpe_tokens'] else 1):
             raise ValueError('Invalid codebook.' + name)
     book = settings['codebook']
+    if book['metric'] not in ['spherical','euclidean'] or book['normalization'] not in ['rms','amplitude_percentile'] or not 0<book['amplitude_percentile']<=100:
+        raise ValueError('Invalid dictionary metric/normalization')
     if book['atomic_vocab'] < 2 or book['atomic_vocab'] + book['merges'] >= 65535:
         raise ValueError('Invalid structural vocabulary size')
     batch = settings['data']['batch_size_per_gpu']
@@ -137,15 +146,43 @@ def validate_vocabulary(path, data, teacher=None):
     return book
 
 
+def prepare_stage_config(path,gpu,device):
+    c=load_config(path)
+    if c['training']['stage']=='pretrain':
+        aug=c['data']['augmentation']
+        if aug['phase_rotation_probability'] or any(aug['modulation_only'][k] for k in ['phase_rotation_probability','circular_shift_probability']):
+            raise ValueError('Pretraining structure targets require unaugmented IQ')
+    if c['training']['max_steps']:raise ValueError('Use complete epoch budgets in the automatic pipeline')
+    if c['checkpoint']['resume_from']:raise ValueError('Use pipeline --resume, not a config resume_from')
+    if not c['checkpoint']['save_last'] or not c['checkpoint']['save_best']:raise ValueError('Pipeline requires last/best checkpoint saving')
+    if c['evaluation']['early_stopping']['patience']:raise ValueError('This full-budget pipeline requires early stopping disabled')
+    c['runtime'].update(device=device,gpus=gpu if device!='cpu' else '',processes=1)
+    for key in ['data','codebook','init_checkpoint','warmstart_checkpoint']:
+        if c['run'][key]:c['run'][key]=absolute(c['run'][key])
+    return c
+
+
+
 def initial_configs(settings, gpu, device, processes=1):
     cards = validate_devices(gpu, processes, device)
-    first, fine = prepare_configs(absolute(settings['configs']['pretrain']),
-                                 absolute(settings['configs']['finetune']), cards[0], device)
+    first=prepare_stage_config(absolute(settings['configs']['pretrain']),cards[0],device)
+    if first['training']['stage']!='pretrain':raise ValueError('Expected a structural pretraining config')
     if first['run']['init_checkpoint'] or first['run']['warmstart_checkpoint']:
         raise ValueError('Round1 must initialize the current architecture from scratch')
     first['run']['codebook'] = absolute(settings['round1']['codebook'])
     first['training']['epochs'] = settings['round1']['epochs']
-    validate_vocabulary(first['run']['codebook'], first['run']['data'])
+    vocabulary=validate_vocabulary(first['run']['codebook'], first['run']['data'])
+    for key,default in [('metric','spherical'),('normalization','rms'),('amplitude_percentile',99.),('min_frequency',1)]:
+        actual=vocabulary.get(key,default)
+        requested=settings['codebook'].get(key,default)
+        if actual!=requested:
+            raise ValueError(f'Round1 vocabulary differs from the requested method: {key}; '
+                f'vocabulary={actual!r}, config codebook.{key}={requested!r}; '
+                f'vocabulary directory={first["run"]["codebook"]}. '
+                'Align the workflow codebook settings with this vocabulary, or build a new vocabulary; '
+                'changing only round1.codebook does not change the round2 construction method.')
+    if vocabulary.get('normalization','rms')!=first['model']['signal']['normalization']:
+        raise ValueError('Dictionary and backbone normalization must match')
     second = deepcopy(first)
     second['training']['epochs'] = settings['round2']['epochs']
     second['experiment'].update(name='pretrain_shared_base_round2',
@@ -154,14 +191,14 @@ def initial_configs(settings, gpu, device, processes=1):
         backbone_lr_factor=settings['round2']['backbone_lr_factor'])
     # Deliberately unresolved until this run's teacher/vocabulary are complete.
     second['run'].update(codebook='', init_checkpoint='', warmstart_checkpoint='')
-    fine['run'].update(init_checkpoint='', warmstart_checkpoint='', codebook='')
-    for config in [first, second, fine]:
+    configs={'pretrain_round1':first,'pretrain_round2':second}
+    for config in configs.values():
         config['runtime'].update(gpus=','.join(cards) if device != 'cpu' else '', processes=processes)
         batch = settings.get('data', {}).get('batch_size_per_gpu', 0)
         if batch:
             config['data']['batch_size'] = batch
         validate_config(config)
-    return {'pretrain_round1': first, 'pretrain_round2': second, 'finetune': fine}
+    return configs
 
 
 class Pipeline:
@@ -223,11 +260,17 @@ class Pipeline:
             env['CUDA_VISIBLE_DEVICES'] = ''
         elif single_gpu and self.manifest['device'] != 'cpu':
             env['CUDA_VISIBLE_DEVICES'] = self.manifest['gpu'].split(',')[0]
-        with console.open('a', buffering=1) as log:
-            self.child = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                                          env=env, start_new_session=True)
+        stream_console=self.manifest.get('stream_console',False)
+        with console.open('ab', buffering=0) as log:
+            self.child = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE if stream_console else log,
+                                          stderr=subprocess.STDOUT,env=env,start_new_session=True,bufsize=0)
             processes = 1 if cpu or single_gpu else self.manifest.get('processes', 1)
             self.status(stage + '_running', child_pid=self.child.pid, console=str(console), processes=processes)
+            if stream_console:
+                while chunk:=self.child.stdout.read(8192):
+                    log.write(chunk)
+                    if hasattr(sys.stdout,'buffer'):sys.stdout.buffer.write(chunk);sys.stdout.buffer.flush()
+                    else:sys.stdout.write(chunk.decode(errors='replace'));sys.stdout.flush()
             result = self.child.wait()
             self.child = None
         if result:
@@ -282,8 +325,12 @@ class Pipeline:
         book = self.manifest['settings']['codebook']
         grouped = {'run': {'data': data, 'output': str(output), 'teacher_checkpoint': teacher},
             'atomic': {'vocab_size': book['atomic_vocab'], 'max_patches': book['max_patches'],
-                       'iterations': book['cluster_iterations'], 'chunk_size': book['cluster_chunk_size']},
-            'emergent': {'merges': book['merges'], 'max_span': book['max_span'], 'fit_sequences': book['fit_sequences']},
+                       'iterations': book['cluster_iterations'], 'chunk_size': book['cluster_chunk_size'],
+                       'metric':book.get('metric','spherical'),'normalization':book.get('normalization','rms'),
+                       'amplitude_percentile':book.get('amplitude_percentile',99.),
+                       'batch_size':book.get('cluster_batch_size',16384),'initializations':book.get('cluster_initializations',5)},
+            'emergent': {'merges': book['merges'], 'max_span': book['max_span'], 'fit_sequences': book['fit_sequences'],
+                         'fit_tokens':book.get('bpe_tokens',0),'min_frequency':book.get('min_frequency',1)},
             'runtime': {'batch_size': book['batch_size'], 'seed': book['seed'], 'threads': book['threads'],
                         'device': self.manifest['device'], 'gpus': self.manifest['gpu'].split(',')[0] if self.manifest['device'] != 'cpu' else ''}}
         config_path = self.directory / 'codebook_round2_config.json'
@@ -302,37 +349,44 @@ class Pipeline:
 
     def run(self):
         configs = {name: read_json(self.directory / (name + '_config.json'))
-                   for name in ['pretrain_round1', 'pretrain_round2', 'finetune']}
+                   for name in ['pretrain_round1', 'pretrain_round2']}
         teacher = self.train('pretrain_round1', configs['pretrain_round1'])
         vocabulary = self.build_vocabulary(teacher, configs['pretrain_round1']['run']['data'])
         second = configs['pretrain_round2']
         second['run'].update(init_checkpoint=teacher, codebook=vocabulary, warmstart_checkpoint='')
         pretrained = self.train('pretrain_round2', second)
-        fine = configs['finetune']
-        fine['run'].update(init_checkpoint=pretrained, codebook='', warmstart_checkpoint='')
-        tuned = self.train('finetune', fine)
-        export = self.directory / 'exported_model'
-        self.execute('export', 'export.py', ['--checkpoint', tuned, '--output', str(export)], cpu=True)
-        write_json(self.directory / 'completion.json', {'status': 'complete',
-                   'stages': self.manifest['stages'], 'export': str(export)})
-        self.status('complete', export=str(export))
+        result={'status':'pretrain_complete','workflow':'two_round_pretrain','pipeline_directory':str(self.directory),
+                'checkpoint':pretrained,'stages':self.manifest['stages']}
+        write_json(self.directory/'pretraining_completion.json',result)
+        write_json(self.directory/'completion.json',result)
+        write_json(self.directory.parent/'latest_pretrained.json',result)
+        self.status('pretrain_complete',checkpoint=pretrained)
 
 
-def main(default_config=DEFAULT_CONFIG, required_processes=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config', type=Path, default=default_config)
+
+def run_workflow():
+    """Called only by train.py after examining the configuration type."""
+    description='Two-round structural pretraining; stops without finetuning. All stages use the shared trainer.'
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--gpu', '--gpus', dest='gpu', help='Physical GPU index or supported pair')
     parser.add_argument('--processes', type=int, choices=[1, 2], help='Override training process count')
     parser.add_argument('--device', choices=['auto', 'cpu'])
     parser.add_argument('--resume', type=Path, help='Continue a frozen pipeline directory')
+    parser.add_argument('--batch-size',type=int,help='Override per-process training batch')
+    parser.add_argument('--output',type=Path,help='Override workflow output root')
     args = parser.parse_args()
     if int(os.environ.get('WORLD_SIZE', '1')) != 1 or 'LOCAL_RANK' in os.environ:
         parser.error('Run one pipeline coordinator directly; it launches distributed training itself')
     if args.resume:
+        if args.batch_size is not None or args.output is not None:parser.error('Resume keeps the frozen batch and output')
         directory = args.resume.resolve()
         manifest = read_json(directory / 'manifest.json')
         gpu, device = manifest['gpu'], manifest['device']
         processes = manifest.get('processes', 1)
+        if manifest.get('workflow')!='two_round_pretrain':
+            if manifest['stages'].get('finetune') or (directory/'finetune/latest_run.json').exists():
+                raise ValueError('This workflow has already started finetuning; cannot convert it to pretrain-only')
         if ((args.gpu is not None and args.gpu != gpu) or (args.device is not None and args.device != device)
                 or (args.processes is not None and args.processes != processes)):
             parser.error('Resume with the original GPU/device/process count')
@@ -345,17 +399,11 @@ def main(default_config=DEFAULT_CONFIG, required_processes=None):
         gpu = args.gpu if args.gpu is not None else settings['runtime']['gpu']
         device = args.device if args.device is not None else settings['runtime']['device']
         processes = args.processes if args.processes is not None else settings['runtime']['processes']
-    if required_processes is not None and processes != required_processes:
-        parser.error(f'This entry requires {required_processes} training processes')
     cards = validate_devices(gpu, processes, device)
     gpu = ','.join(cards)
-    if device != 'cpu':
-        for card in cards:
-            active = subprocess.check_output(['nvidia-smi', '--id=' + card,
-                '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
-            if active:
-                raise RuntimeError('GPU' + card + ' is occupied; no new trainer started. PIDs: ' + active)
     if not args.resume:
+        if args.batch_size is not None:settings['data']['batch_size_per_gpu']=args.batch_size
+        if args.output is not None:settings['run']['output']=str(args.output.resolve())
         configs = initial_configs(settings, gpu, device, processes)
         directory = Path(absolute(settings['run']['output'])) / stamp()
         directory.mkdir(parents=True, exist_ok=False)
@@ -368,10 +416,19 @@ def main(default_config=DEFAULT_CONFIG, required_processes=None):
         shutil.copytree(ROOT / 'code', snapshot, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
         write_json(directory / 'source_snapshot/sha256.json',
                    {str(p.relative_to(snapshot)): digest(p) for p in snapshot.rglob('*') if p.is_file()})
-        manifest = {'format_version': 2, 'gpu': gpu, 'device': device, 'processes': processes, 'settings': settings,
+        manifest = {'format_version': 3, 'gpu': gpu, 'device': device, 'processes': processes, 'settings': settings,
                     'code_snapshot': str(snapshot), 'stages': {},
+                    'workflow':'two_round_pretrain',
                     'architecture_sha256': hashlib.sha256(json.dumps(model_options(configs['pretrain_round1']), sort_keys=True).encode()).hexdigest()}
     pipeline = Pipeline(directory, manifest)
+    if manifest.get('workflow')!='two_round_pretrain':
+        # Conversion changes orchestration only. The trainer's frozen source,
+        # exact stage configs, vocabulary, optimizer and schedule are preserved.
+        write_json(directory/('manifest_before_split_'+stamp()+'.json'),deepcopy(manifest))
+        manifest.setdefault('workflow_history',[]).append({'from':manifest.get('workflow','full'),
+            'to':'two_round_pretrain','time':datetime.now(ZoneInfo('Asia/Shanghai')).isoformat()})
+        manifest['workflow']='two_round_pretrain'
+    manifest['stream_console']=True
     pipeline.save()
     write_json(directory.parent / 'latest_pipeline.json', {'pipeline_directory': str(directory), 'pid': os.getpid()})
     pipeline.status('starting', directory=str(directory), gpu=gpu)
@@ -383,6 +440,3 @@ def main(default_config=DEFAULT_CONFIG, required_processes=None):
         pipeline.status('failed', error=repr(error))
         raise
 
-
-if __name__ == '__main__':
-    main()

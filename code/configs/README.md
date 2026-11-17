@@ -1,18 +1,20 @@
 # 配置目录与参数说明
 
-统一P8候选入口为`{supervised,pretrain,finetune}/shared_base_p8.json5`，三阶段共享P8骨干；独立流程配置为[pipeline/shared_base_iterative_p8_dual.json5](pipeline/shared_base_iterative_p8_dual.json5)。默认GPU2,3，每卡128，30轮→新模型构词→50轮→微调20轮，预训练跨度8、比例30%。启动`bash code/training/run_iterative_pretrain_p8_dual.sh`；需新P8缓存及第一轮词表，不能混用旧P16标签。[P8说明](../../docs/shared_base_p8_training.md)。原P16入口保留。
+当前统一入口为 `python code/training/train.py --config <配置>`：
 
-2026-11-15当前共享基座正式配置（统一交给`code/training/train.py`）：
-
-| 阶段 | 配置 |
+| 用途 | 正式配置 |
 | --- | --- |
-| 从头有监督 | [supervised/shared_base.json5](supervised/shared_base.json5) |
-| 结构预训练 | [pretrain/shared_base.json5](pretrain/shared_base.json5) |
-| 预训练基座微调 | [finetune/shared_base.json5](finetune/shared_base.json5) |
+| P8从头监督 | [supervised/shared_base_p8.json5](supervised/shared_base_p8.json5) |
+| P8独立第一轮 | [pretrain/shared_base_p8.json5](pretrain/shared_base_p8.json5) |
+| P8独立第二轮 | [pretrain/shared_base_p8_round2.json5](pretrain/shared_base_p8_round2.json5) |
+| P8两轮预训练 | [pretrain/two_rounds_p8.json5](pretrain/two_rounds_p8.json5) |
+| P8独立微调 | [finetune/shared_base_p8.json5](finetune/shared_base_p8.json5) |
 
-三者共享768×12、P16主干和同一`iq_geometry`设置，预训练关闭增强、监督/微调仅前14类相位增强。预训练正式配置现为原始I/Q的v1词表、30轮。完整迭代流程入口：`bash code/training/run_iterative_pretrain.sh`；[pipeline/shared_base_iterative.json5](pipeline/shared_base_iterative.json5)集中配置第一轮30轮、新模型构词参数、第二轮50轮；最后沿用微调正式配置的20轮。实际第二轮与微调配置在流程目录内冻结，并绑定本次精确权重。[架构、配置、恢复与日志说明](../../docs/shared_base_training.md)。以下为保留的历史实验。
+两轮LR-v2只执行50轮→新教师构词→50轮，然后停止；微调独立20轮。两轮保留当前GPU2,3、每卡256；第一轮6e-4/6e-4，第二轮骨干3e-4/结构头6e-4，均10%warmup+cosine。微调默认单卡GPU0、batch256，骨干1e-4/任务头3e-4，3%warmup+cosine。三阶段共享骨干；P16的`shared_base.json5`及`pipeline/`历史实验配置保留。旧流程配置中的`configs.finetune`只为读取历史配置保留，在统一入口下不参与预训练，也不会触发微调。详细参数、初始化、恢复及双卡设置见[统一训练说明](../../docs/unified_training.md)。
 
-双卡入口：`bash code/training/run_iterative_pretrain_dual.sh`，对应[pipeline/shared_base_iterative_dual.json5](pipeline/shared_base_iterative_dual.json5)。`runtime.gpu`选择0,1或2,3或4,5，`processes=2`；`data.batch_size_per_gpu=128`对应全局256。构词用组内第一张卡、单进程。流程参数不会改变三阶段共享骨干或输入语义；每次启动冻结实际阶段配置，恢复不能改卡数和批量。
+独立第二轮只需配置`run.init_checkpoint`（第一轮固定权重）及`run.codebook`（该教师生成的新词表），再执行统一`train.py`。未构词时先用[codebook/shared_base_p8_round2.json5](codebook/shared_base_p8_round2.json5)离线生成；已有完整词表则跳过。更换词表使用骨干初始化，恢复同一轮才使用`resume`。
+
+以下为保留的历史实验。
 
 2026-11-14新增[`supervised/shift_consistent.json5`](supervised/shift_consistent.json5)：从67.57%候选进行单次24,000步长训练，使用共享Patch偏移适配器和原始/增强成对监督。此配置属于专用`train_shift_consistent.py`，不交给旧`train.py`解析。后台启动：`bash code/training/run_shift_consistent.sh`。[详细说明](../../docs/shift_consistent_training.md)。
 

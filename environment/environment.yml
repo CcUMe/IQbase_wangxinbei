@@ -10,5 +10,6 @@ dependencies:
       - pyarrow>=19.0.1
       - tqdm>=4.66
       - tensorboard>=2.18,<3
+      - scikit-learn>=1.6
 # For exact locally tested package versions see requirements_lock.txt.
 # Select a target-platform CUDA build explicitly before preparing submission.

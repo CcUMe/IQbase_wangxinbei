@@ -8,3 +8,11 @@ core
 core.*
 合肥讲座/
 .vscode/
+reference/
+docs/
+
+# Model checkpoints stay local; keep experiment configs and logs tracked.
+*.pt
+*.pth
+*.ckpt
+*.safetensors

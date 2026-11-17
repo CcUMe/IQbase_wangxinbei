@@ -1,12 +1,10 @@
 # C01 电磁感知模型：训练与推理代码
 
-2026-11-15新增统一P8候选：三阶段入口`code/configs/{supervised,pretrain,finetune}/shared_base_p8.json5`；默认GPU2,3双卡执行`bash code/training/run_iterative_pretrain_p8_dual.sh`。新P8原始词表预训练30轮→本轮教师构词→第二轮50轮→微调20轮→导出；预训练跨度8、比例30%，每卡128。P8缓存保留原波形、标签与划分，使用新指纹及新词表，不复用P16目标。P16全部历史产物保留。[P8准备、启动与恢复](docs/shared_base_p8_training.md)。该候选尚无正式精度结论。
+2026-11-16训练统一为 `python code/training/train.py --config ...`，通过配置分别启动两轮预训练和独立微调。P8正式配置：`pretrain/two_rounds_p8.json5`、`finetune/shared_base_p8.json5`；预训练50轮→新教师构词→第二轮50轮后停止，不自动微调。当前两轮配置保留GPU2,3、每卡256；LR-v2第一轮6e-4/6e-4、第二轮骨干3e-4/结构头6e-4，均10%warmup+cosine。微调单卡GPU0、全参20轮、骨干1e-4/任务头3e-4、权重衰减0.08、3%warmup+cosine；新输出目录`logs/shared_base_p8_lr_v2`及`logs/finetune_shared_base_p8_lr_v2`。重复的专用Python/bash启动器已移除，历史配置和产物保留。见[统一训练入口与配置](docs/unified_training.md)。
 
-2026-11-15当前三阶段入口为`code/configs/{supervised,pretrain,finetune}/shared_base.json5`，统一使用同一95.909M共享时频主干与局部I/Q几何残差；相位增强只用于监督/微调。当前完整流程：`bash code/training/run_iterative_pretrain.sh`，默认单卡GPU0，原始I/Q第一轮词表预训练30轮→用本轮新模型重建词表→继承骨干进行第二轮预训练50轮→微调20轮→自动导出。预算和构词参数集中在`code/configs/pipeline/shared_base_iterative.json5`。流程冻结配置/源码，支持`--resume <流程目录>`，历史词表和训练记录保留。[三阶段配置与架构说明](docs/shared_base_training.md)。新结构的完整训练收益尚未确定。
+P8/P16三阶段模型说明分别见[P8说明](docs/shared_base_p8_training.md)、[共享基座说明](docs/shared_base_training.md)。本次没有修改架构或宣称新精度收益。欧氏构词候选及论文适配边界见[结构预训练论文核查](docs/structural_paper_audit_20261116.md)；C01没有真实采样率，不伪造RoPE-fs。
 
-以下保留各历史实验的入口和结果；当前三阶段流程以以上配置和说明为准。
-
-双卡一键入口：`bash code/training/run_iterative_pretrain_dual.sh`，默认通信组0,1；可用`C01_GPUS=2,3`或`4,5`选择其他已分配空闲组。两轮预训练与微调用DDP，构词仅组内第一张卡；每卡128保持全局batch256。独立配置`code/configs/pipeline/shared_base_iterative_dual.json5`，输出`logs/shared_base_iterative_dual/<时间戳>/`。单卡入口保留；双卡入口不能直接resume单卡流程。[使用与恢复说明](docs/shared_base_training.md#双卡一键迭代入口)。
+以下为历史实验说明。
 
 2026-11-14新增单次长训练入口：`bash code/training/run_shift_consistent.sh`，默认GPU0后台运行，从67.57%候选热启动，加入共享Patch偏移适配器、原始/增强成对监督与一致性约束。支持严格断点恢复、EMA、三任务全量验证和自动导出历史最佳；尚未证明新增架构的正式精度收益。[配置与运行说明](docs/shift_consistent_training.md)。
 
@@ -30,7 +28,7 @@
 
 ## 配置驱动启动
 
-预训练后默认从第一步全参微调：任务头峰值LR3e-4、基座3e-5，前3%更新线性预热后cosine衰减至5%，20轮、单卡batch256。三份带注释JSON5区分预训练来源，best.pt按调制准确率选择，并保留综合最佳候选。策略与恢复规则见[微调说明](docs/finetuning.md)；质量收益仍需正式对照验证。
+当前P8 LR-v2从第一步全参微调：任务头峰值LR3e-4、骨干1e-4，前3%更新线性预热后cosine衰减至5%，20轮、单卡batch256。best.pt按调制准确率选择，并保留综合最佳候选。配置与恢复见[统一训练说明](docs/unified_training.md)；历史round配置沿用各自配方，质量收益仍需正式训练验证。
 
 已激活py313环境后，核心入口只需传配置，数据/输出/词表/检查点和GPU均在配置中：
 

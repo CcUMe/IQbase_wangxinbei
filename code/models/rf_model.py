@@ -232,7 +232,13 @@ class Backbone(nn.Module):
         if self.config['normalize_fusion']:
             time = F.layer_norm(time, (time.shape[-1],))
             frequency = F.layer_norm(frequency, (frequency.shape[-1],))
-        gate = torch.sigmoid(self.gate(torch.cat((time, frequency), -1)))
+        # Normalize ONLY the gate's conditions. Keep the original value paths,
+        # including relative patch amplitude, intact for all three tasks.
+        gate_time, gate_frequency = time, frequency
+        if self.config.get('gate_input_normalization', False):
+            gate_time = F.layer_norm(time, (time.shape[-1],))
+            gate_frequency = F.layer_norm(frequency, (frequency.shape[-1],))
+        gate = torch.sigmoid(self.gate(torch.cat((gate_time, gate_frequency), -1)))
         h = time + gate * self.freq_projection(frequency)
         h = h + self.scale_projection(scale.log()[:, None])[:, None] * float(self.config['scale_embedding'])
         if global_power is not None:
@@ -269,31 +275,6 @@ class Backbone(nn.Module):
         if return_context:
             return encoded, valid, target, context
         return encoded, valid, target
-
-
-class PatchBackbone(nn.Module):
-    """Plain shared IQ-patch Transformer for the paper-method reference branch."""
-    def __init__(self,config):
-        super().__init__();self.config=config;self.patch_size=config['patch_size']
-        d=config['width']
-        self.patch_projection=nn.Linear(self.patch_size*2,d)
-        self.mask_embedding=nn.Parameter(torch.zeros(d))
-        self.blocks=nn.ModuleList([Block(d,config['heads'],config['dropout'],config['mlp_ratio'],
-            config['attention_dropout'],config['rope_base'],config['qk_normalization'],config['qk_scale']) for _ in range(config['depth'])])
-        self.norm=nn.LayerNorm(d)
-
-    preprocess=Backbone.preprocess
-
-    def forward(self,iq,lengths,patch_mask=None,sample_rates=None):
-        x,target,_,_=self.preprocess(iq,lengths,patch_mask)
-        b,t,_=x.shape;p=self.patch_size;n=t//p
-        valid=torch.arange(n,device=x.device)[None]*p<lengths[:,None]
-        h=self.patch_projection(x.reshape(b,n,p*2))
-        h=h+self.mask_embedding*(0 if patch_mask is None else patch_mask[...,None])
-        positions,_=position_coordinates(lengths,n,p,self.config['heads'],self.config['position'],
-                                         self.config['position_options'],sample_rates)
-        for block in self.blocks:h=block(h,valid,positions)
-        return self.norm(h)*valid[...,None],valid,target
 
 
 class HybridBackbone(Backbone):
@@ -379,12 +360,13 @@ class RFModel(nn.Module):
                         phase_features=False, global_spectrum=True, spectral_backend='fft', position='samples',
                         parameter_mode='regression', pretrain_heads=False, atomic_vocab=0, emergent_vocab=0,
                         mlp_ratio=4.0, attention_dropout=model_config.get('dropout', 0.1), rope_base=10000.0,
-                        rms_epsilon=1e-6, classification_hidden_ratio=0.5, grid_residual_scale=0.1,
+                        rms_epsilon=1e-6, gate_input_normalization=False,
+                        classification_hidden_ratio=0.5, grid_residual_scale=0.1,
                         parameter_query_temperature=1.0, qk_normalization=False, normalize_fusion=False, qk_scale=1.0,
                         contrastive_head=False, contrastive_projection_dim=128, classification_pooling='mean',
                         physical_statistics=False, local_refinement=False, classification_fp32=False,
                         scale_embedding=True, global_spectrum_input=True, multiscale_frontend=False,
-                        frontend='time_frequency',normalization='rms',amplitude_percentile=99.)
+                        normalization='rms',amplitude_percentile=99.)
         self.config = {**defaults, **model_config}
         self.config['pyramid'] = pyramid_options(model_config.get('pyramid'))
         self.config['hierarchy'] = hierarchy_options(model_config.get('hierarchy'))
@@ -415,10 +397,6 @@ class RFModel(nn.Module):
             self.config['width'] = self.config['hierarchy']['stage_widths'][-1]
             self.config['depth'] = sum(self.config['hierarchy']['stage_depths'])
         self.multiresolution = self.config['pyramid']['enabled'] or self.hierarchical or self.hybrid
-        if self.config['frontend'] not in ['time_frequency','linear_iq']:
-            raise ValueError('Unknown frontend')
-        if self.config['frontend']=='linear_iq' and (self.multiresolution or any(self.config[k]['enabled'] for k in ['iq_geometry','patch_shift','density_encoding','phase_relations']) or any(self.config[k] for k in ['phase_features','global_spectrum','scale_embedding','global_spectrum_input','local_refinement','multiscale_frontend']) or self.config['position_options'].get('absolute_features',True)):
-            raise ValueError('linear_iq requires only the shared IQ patch Transformer, without extra input adapters')
         if self.config['iq_geometry']['enabled'] and (self.multiresolution or self.config['patch_shift']['enabled'] or
                 self.config['density_encoding']['enabled'] or any(self.config.get(k,False) for k in ['local_refinement','multiscale_frontend'])):
             raise ValueError('iq_geometry uses the shared single-scale frontend; disable other experimental frontend adapters')
@@ -450,8 +428,7 @@ class RFModel(nn.Module):
         self.config['position_options'] = {**POSITION_DEFAULTS, **supplied}
         if 'reference_sample_rate' in model_config and 'reference_sample_rate_hz' not in supplied:
             self.config['position_options']['reference_sample_rate_hz'] = model_config['reference_sample_rate']
-        self.backbone = (PatchBackbone(self.config) if self.config['frontend']=='linear_iq' else
-                         UnifiedBackbone(self.config) if self.hybrid and self.config['hybrid']['topology'] == 'serial' else
+        self.backbone = (UnifiedBackbone(self.config) if self.hybrid and self.config['hybrid']['topology'] == 'serial' else
                          HybridBackbone(self.config) if self.hybrid else
                          HierarchicalBackbone(self.config) if self.hierarchical else Backbone(self.config))
         self.schema = schema

@@ -3,7 +3,9 @@ import heapq
 import numpy as np
 
 
-def learn_merges(sequences, atomic_vocab, number, max_span=5):
+def learn_merges(sequences, atomic_vocab, number, max_span=5, min_frequency=1):
+    if not sequences or any(not len(s) for s in sequences):raise ValueError('BPE requires nonempty sequences')
+    if type(min_frequency) is not int or min_frequency<1:raise ValueError('BPE minimum frequency must be positive')
     width = max(map(len, sequences))
     tokens = np.full((len(sequences), width), -1, np.int32)
     for i, seq in enumerate(sequences):
@@ -20,6 +22,7 @@ def learn_merges(sequences, atomic_vocab, number, max_span=5):
             break
         counts = np.bincount(encoded, minlength=capacity * capacity)
         pair = int(counts.argmax())
+        if counts[pair]<min_frequency:break
         a, b = divmod(pair, capacity)
         new = atomic_vocab + step
         lengths[new] = lengths[a] + lengths[b]

@@ -54,6 +54,33 @@ class CommandConfigTests(unittest.TestCase):
             run.assert_not_called()
             self.assertEqual(os.environ['CUDA_VISIBLE_DEVICES'],'0,1')
 
+    def test_completed_round2_pointer_and_pending_round2(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);pipeline=root/'pipeline';pipeline.mkdir()
+            first=pipeline/'round1.pt';first.touch()
+            second=pipeline/'round2.pt';second.touch()
+            manifest={'stages':{'pretrain_round1':{'complete':True,'best_checkpoint':str(first)},
+                                'pretrain_round2':{'complete':False}}}
+            (pipeline/'manifest.json').write_text(json.dumps(manifest))
+            (root/'latest_pipeline.json').write_text(json.dumps({'pipeline_directory':str(pipeline)}))
+            with self.assertRaisesRegex(ValueError,'pretrain_round2'):checkpoint_reference(root)
+            self.assertEqual(checkpoint_reference(first),first)
+            manifest['stages']['pretrain_round2']={'complete':True,'best_checkpoint':str(second)}
+            (pipeline/'manifest.json').write_text(json.dumps(manifest))
+            pointer={'pipeline_directory':str(pipeline),'checkpoint':str(second)}
+            (root/'latest_pretrained.json').write_text(json.dumps(pointer))
+            self.assertEqual(checkpoint_reference(root),second)
+            self.assertEqual(checkpoint_reference(pipeline),second)
+            pointer['checkpoint']=str(first)
+            (root/'latest_pretrained.json').write_text(json.dumps(pointer))
+            with self.assertRaisesRegex(ValueError,'does not match'):checkpoint_reference(root)
+
+    def test_checkpoint_pointer_cycle_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            (root/'latest_pipeline.json').write_text(json.dumps({'pipeline_directory':str(root)}))
+            with self.assertRaisesRegex(ValueError,'Cyclic'):checkpoint_reference(root)
+
     def test_launch_preserves_explicit_shutdown_timeout(self):
         with patch.dict(os.environ, {'TORCH_ELASTIC_SHUTDOWN_TIMEOUT': '7'}, clear=True), \
              patch('utils.command_config.os.execvpe', side_effect=SystemExit(0)) as launch:

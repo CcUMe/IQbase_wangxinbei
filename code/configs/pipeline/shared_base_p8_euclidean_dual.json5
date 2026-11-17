@@ -1,0 +1,48 @@
+// 待验证的词表方法候选；不改变正在运行的P8流程。
+// 与当前P8同骨干、同三任务头、同RMS与遮蔽策略，避免同时改架构和遮蔽难度。
+{
+  "configs": {
+    "pretrain": "code/configs/pretrain/shared_base_p8_euclidean.json5",
+    "finetune": "code/configs/finetune/shared_base_p8.json5"
+  },
+  "run": {
+    "output": "logs/shared_base_p8_euclidean_dual"
+  },
+  "round1": {
+    "epochs": 30,
+    "codebook": "artifacts/structure_research_p8_euclidean/codebook_v1"
+  },
+  "round2": {
+    "epochs": 50,
+    "learning_rate": 0.0003,
+    "backbone_lr_factor": 0.3333333333333333
+  },
+  "data": {
+    "batch_size_per_gpu": 128
+  },
+  // 这些设置同时传给本流程的新教师词表，避免第二轮悄悄回到球面聚类。
+  "codebook": {
+    "atomic_vocab": 512,
+    "max_patches": 200000,
+    "cluster_iterations": 20,
+    "cluster_chunk_size": 4096,
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "batch_size": 128,
+    "seed": 20261115,
+    "threads": 4,
+    "metric": "euclidean",
+    "normalization": "rms",
+    "amplitude_percentile": 99.0,
+    "cluster_batch_size": 16384,
+    "cluster_initializations": 5,
+    "bpe_tokens": 0,
+    "min_frequency": 20
+  },
+  "runtime": {
+    "gpu": "2,3",
+    "device": "auto",
+    "processes": 2
+  }
+}

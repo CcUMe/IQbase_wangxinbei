@@ -1,0 +1,45 @@
+{
+  "workflow": "two_round_pretrain",
+  "configs": {
+    "pretrain": "code/configs/pretrain/accuracy_fusion_20261116/gate_norm.json"
+  },
+  "run": {
+    "output": "logs/accuracy_fusion_20261116/pretrain_two_rounds_gate_norm"
+  },
+  "round1": {
+    "epochs": 50,
+    "codebook": "artifacts/structure_research_p8_euclidean/codebook_v1"
+  },
+  "round2": {
+    "epochs": 50,
+    "learning_rate": 0.0006,
+    "backbone_lr_factor": 0.5
+  },
+  "data": {
+    "batch_size_per_gpu": 256
+  },
+  "codebook": {
+    "atomic_vocab": 512,
+    "max_patches": 200000,
+    "cluster_iterations": 20,
+    "cluster_chunk_size": 4096,
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "batch_size": 128,
+    "seed": 20261115,
+    "threads": 4,
+    "metric": "euclidean",
+    "normalization": "rms",
+    "amplitude_percentile": 99.0,
+    "cluster_batch_size": 16384,
+    "cluster_initializations": 5,
+    "bpe_tokens": 0,
+    "min_frequency": 20
+  },
+  "runtime": {
+    "gpu": "2,3",
+    "device": "auto",
+    "processes": 2
+  }
+}

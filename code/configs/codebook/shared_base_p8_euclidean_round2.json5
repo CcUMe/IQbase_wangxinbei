@@ -1,0 +1,36 @@
+// 独立第二轮构词：冻结第一轮教师提取完整Token特征，训练集拟合欧氏聚类与BPE。
+// run.teacher_checkpoint与pretrain/shared_base_p8_round2.json5的run.init_checkpoint对应同一固定权重。
+// 建议第一轮训练完成后运行；若使用中途权重，先保存固定副本，避免best.pt在构词后又变化。
+// output应为新的空目录；已有完整第二轮词表时可跳过本命令，直接在训练配置填写其路径。
+{
+  "run": {
+    "data": "artifacts/data_full_p8",
+    "output": "artifacts/structure_research_p8_euclidean/codebook_v2_manual",
+    "teacher_checkpoint": "/home/yangqilin/code/IQbase_wangxinbei/logs/shared_base_p8_lr_v2/20261116_132341_818567/pretrain_round1/20261116_132350_303906/best.pt"
+  },
+  "atomic": {
+    "vocab_size": 512,
+    "max_patches": 200000,
+    "iterations": 20,
+    "chunk_size": 4096,
+    "metric": "euclidean",
+    "normalization": "rms",
+    "amplitude_percentile": 99.0,
+    "batch_size": 16384,
+    "initializations": 5
+  },
+  "emergent": {
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "fit_tokens": 0,
+    "min_frequency": 20
+  },
+  "runtime": {
+    "batch_size": 128,
+    "seed": 20261115,
+    "device": "auto",
+    "threads": 4,
+    "gpus": "2"
+  }
+}

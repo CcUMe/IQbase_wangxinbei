@@ -99,13 +99,22 @@ def supervised_loss(output, batch, scaler, grids, config, distributed=True):
     return loss, parts
 
 
-def patch_mask(lengths, patch_size, ratio, span, seed, iq=None, strategy='random', energy_fraction=0.5, energy_floor=0.05):
-    if strategy not in ['random', 'energy_mixed']:
+def patch_mask(lengths, patch_size, ratio, span, seed, iq=None, strategy='random', energy_fraction=0.5, energy_floor=0.05, start_probability=0.):
+    if strategy not in ['random', 'energy_mixed','bernoulli_starts']:
         raise ValueError('Unknown mask strategy')
     rng = np.random.default_rng(seed)
     counts = (lengths.detach().cpu().numpy() // patch_size).astype(int)
     result = np.zeros((len(counts), int(counts.max())), dtype=bool)
     for i, n in enumerate(counts):
+        if strategy=='bernoulli_starts':
+            if not 0<start_probability<1:raise ValueError('Set an explicit Bernoulli start probability')
+            # Explicit interpretation of the paper's unspecified sampler:
+            # independent valid starts, full spans, overlaps allowed, no forced
+            # final ratio or minimum mask count. This is NOT verified author code.
+            width=min(span,n)
+            for start in np.flatnonzero(rng.random(n-width+1)<start_probability):
+                result[i,start:start+width]=True
+            continue
         target = max(1, min(n - 1, int(round(n * ratio))))
         selected = set()
         if strategy == 'energy_mixed' and energy_fraction > 0:
@@ -129,14 +138,24 @@ def patch_mask(lengths, patch_size, ratio, span, seed, iq=None, strategy='random
     return torch.from_numpy(result).to(lengths.device)
 
 
-def pretraining_loss(output, batch, mask, config, codebook=None):
+def pretraining_loss(output, batch, mask, config, codebook=None, distributed=True):
     selected = mask & output['token_valid']
     denominator = selected.sum(1).clamp_min(1)
+    token_mean=config.get('pretraining_reduction','per_record')=='masked_token_mean'
+    world=1;global_count=None
+    if token_mean:
+        import torch.distributed as dist
+        world=dist.get_world_size() if distributed and dist.is_initialized() else 1
+        global_count=selected.sum().float()
+        if world>1:dist.all_reduce(global_count)
+    def reduce(value):
+        if token_mean:return (value*selected).sum()*world/global_count.clamp_min(1)
+        return ((value*selected).sum(1)/denominator).mean()
     loss, parts = zero_anchor(output), {}
     prediction = output['pretrain']['reconstruction'].float()
     target = output['reconstruction_target'].reshape(prediction.shape)
     per_token = (prediction - target).square().mean(-1)
-    reconstruction = ((per_token * selected).sum(1) / denominator).mean()
+    reconstruction = reduce(per_token)
     continuous_weight = config.get('reconstruction_weight', 1.0)
     loss = loss + continuous_weight * reconstruction
     parts['reconstruction'] = float(reconstruction.detach())
@@ -149,7 +168,7 @@ def pretraining_loss(output, batch, mask, config, codebook=None):
             if config.get('equalize_emergent_spans', False) and kind == 'emergent':
                 spans = torch.as_tensor(codebook['symbol_lengths'], device=logits.device)
                 ce = ce / spans[labels.clamp_min(0)]
-            value = ((ce * selected).sum(1) / denominator).mean()
+            value = reduce(ce)
             loss = loss + weight * value
             parts[kind] = float(value.detach())
     if config.get('spectral_loss_weight', 0):
@@ -158,7 +177,7 @@ def pretraining_loss(output, batch, mask, config, codebook=None):
         fa = torch.fft.fft(torch.complex(a[..., 0], a[..., 1]))
         fb = torch.fft.fft(torch.complex(b[..., 0], b[..., 1]))
         per_token = (torch.log1p(fa.abs().square()) - torch.log1p(fb.abs().square())).square().mean(-1)
-        value = ((per_token * selected).sum(1) / denominator).mean()
+        value = reduce(per_token)
         loss = loss + config['spectral_loss_weight'] * value
         parts['spectrum'] = float(value.detach())
     return loss, parts
@@ -226,15 +245,20 @@ def evaluate(model, loader, device, scaler, schema, precision='fp32', max_batche
 @torch.inference_mode()
 def evaluate_pretraining(model, loader, device, config, codebook, maximum=20):
     model.eval()
-    values = []
+    values = [];token_sum=0.;token_count=0
     for step, batch in enumerate(loader):
         if maximum and step >= maximum:
             break
         batch = to_device(batch, device)
         mask = patch_mask(batch['lengths'], model.config['patch_size'], config['mask_ratio'], config['mask_span'], config.get('mask_seed', 12345) + step,
-                          batch['iq'], config.get('mask_strategy', 'random'), config.get('energy_fraction', .5), config.get('energy_floor', .05))
+                          batch['iq'], config.get('mask_strategy', 'random'), config.get('energy_fraction', .5), config.get('energy_floor', .05),config.get('mask_start_probability',0.))
         with autocast(device, config.get('validation_precision', config['precision'])):
             output = model(batch['iq'], batch['lengths'], patch_mask=mask, return_pretrain=True)
-            loss, _ = pretraining_loss(output, batch, mask, config, codebook)
+            loss, _ = pretraining_loss(output, batch, mask, config, codebook,distributed=False)
+        if config.get('pretraining_reduction','per_record')=='masked_token_mean':
+            count=int((mask&output['token_valid']).sum())
+            token_sum+=float(loss)*count;token_count+=count
         values.extend([float(loss)] * len(batch['lengths']))
+    if config.get('pretraining_reduction','per_record')=='masked_token_mean':
+        return token_sum/token_count if token_count else None
     return float(np.mean(values)) if values else None

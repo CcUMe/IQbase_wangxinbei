@@ -149,12 +149,12 @@
     "validate_stage_boundaries": false
   },
 
-  // 微调时基座LR小于随机任务头；有监督从头训练和预训练不缩小基座LR。
+  // 微调：加强AdamW正则至0.08；保留骨干3e-5、任务头3e-4，全参20轮。
   "optimizer": {
     "name": "adamw",
     "learning_rate": 0.0003,
     "backbone_lr_factor": 0.1,
-    "weight_decay": 0.01,
+    "weight_decay": 0.08,
     "betas": [
       0.9,
       0.999

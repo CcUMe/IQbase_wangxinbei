@@ -1,0 +1,23 @@
+{
+  "workflow": "experiment_suite",
+  "run": {
+    "output": "logs/accuracy_fusion_20261116/supervised_suite"
+  },
+  "runtime": {
+    "gpus": "2,3"
+  },
+  "experiments": [
+    {
+      "name": "control",
+      "config": "code/configs/supervised/accuracy_fusion_20261116/control.json"
+    },
+    {
+      "name": "gate_norm",
+      "config": "code/configs/supervised/accuracy_fusion_20261116/gate_norm.json"
+    },
+    {
+      "name": "window256",
+      "config": "code/configs/supervised/accuracy_fusion_20261116/window256.json"
+    }
+  ]
+}

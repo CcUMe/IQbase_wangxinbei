@@ -1,0 +1,6 @@
+{"task": "modulation", "sample_id": "2b2c6943d083e54f49f3ebe7299aaa7f", "prediction": "64QAM"}
+{"task": "modulation", "sample_id": "a0dc4be5de0193fe9b14ee42ce861e37", "prediction": "Radar/Polyphase Barker Code"}
+{"task": "protocol", "sample_id": "6034042fc119449b8bf2bebc616ff8b1", "prediction": "ZigBee"}
+{"task": "protocol", "sample_id": "815d3c4ee2c6f3473b47106bd5f0c2f1", "prediction": "Radar"}
+{"task": "parameter", "sample_id": "83e7392c509d7cf6776a3615edec33f8", "prediction": {"symbol_rate": 0.0, "bandwidth": 0.0, "frequency_shift": 0.0, "pulse_width": 1.2905342716157471e-05, "pri": 1.995686400884471e-05, "time_delay": 5.613842496039678e-06, "number_of_pulses": 3.923583578627258}}
+{"task": "parameter", "sample_id": "4956c986854e46414d7c85318acfdb78", "prediction": {"symbol_rate": 554.3931237359483, "bandwidth": 988.6770968972706, "frequency_shift": 367.38094431627496, "pulse_width": 0.0, "pri": 0.0, "time_delay": 0.0, "number_of_pulses": 0.0}}
