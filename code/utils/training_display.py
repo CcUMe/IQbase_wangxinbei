@@ -73,6 +73,17 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
         f"学习率     : {settings['scheduler']['name']} | 预热 {warmup:,} steps"
         f" | 最低比例 {settings['scheduler']['min_lr_ratio']:g}",
     ])
+    receiver = model.get('receiver_frontend', {})
+    source_sampling=data['sampling'].get('multi_source',{})
+    if data['sampling'].get('target_groups',{}).get('enabled'):
+        lines.append(f"目标组配额 : {data['sampling']['target_groups']['weights']} | 期望有效Token比例；来源/类别/SNR/长度分层")
+    if source_sampling.get('enabled'):
+        lines.append(f"多源抽样   : {source_sampling['probabilities']} | 每步同一来源/长度 | C01任务均衡 / RadioML类别-SNR均衡")
+    if receiver.get('enabled', False):
+        timing = receiver['timing']
+        lines.append(f"接收前端   : 复FIR {receiver['filter']['taps']} taps | 周期候选(样点)={timing['periods']}"
+                     f" | 时相={timing['phases']} | 迭代修正={timing['iterations']} | 原P{model['signal']['patch_size']}坐标/原始通路保留")
+        lines.append('接收监控   : TensorBoard frontend/receiver：残差比例、有效覆盖、局部间隔调整、候选熵；不代表真实符号同步')
     pyramid = model.get('pyramid', {})
     if hybrid and model['hybrid']['topology'] == 'serial':
         mechanism = hierarchy['mechanism']
@@ -144,6 +155,18 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
         lines.append(f"监督目标   : task_weights={loss['task_weights']} | 回归={loss['regression']} | grid_weight={loss['grid_weight']:g}")
         lines.append(f"训练增强   : 随机整窗相位旋转概率={data['augmentation']['phase_rotation_probability']:g}"
                      f" | label_smoothing={loss['label_smoothing']:g} | 验证/推理不增强")
+        augmentation = data['augmentation']
+        modulation = augmentation['modulation_only']
+        lines.append(f"增强范围   : 纯调制记录 classes={modulation['class_indices'] or '全部调制类'}"
+                     f" | 入选概率={modulation.get('apply_probability',1.):g}"
+                     f" | 相位概率={modulation['phase_rotation_probability']:g}"
+                     f" | 循环平移概率={modulation['circular_shift_probability']:g}")
+        lines.append(f"参数增强   : 仅纯参数记录 | 整窗相位概率="
+                     f"{augmentation.get('parameter_only',{}).get('phase_rotation_probability',0.):g} | 参数标签不变")
+        if model.get('parameter_readout',{}).get('enabled',False):
+            readout = model['parameter_readout']
+            lines.append(f"参数读出   : 七项独立回归头 | hidden={readout['hidden_width']}"
+                         f" | query统计标准差={readout['include_std']} | 时间位置bins={readout['temporal_bins']} | FP32")
         lines.append(f"表征目标   : SupCon weight={loss['contrastive']['weight']:g}"
                      f" | temperature={loss['contrastive']['temperature']:g} | 同类不同记录为正样本")
     mid = model.get('mid_fusion', {})
@@ -182,6 +205,11 @@ def training_overview(settings, args, device, world, train_rows, val_rows, info,
         f"输出目录   : {args.output}",
         '显示口径   : step=一次参数更新；loss=本 epoch 平均；分项为有效目标的未加权平均；grad=裁剪前范数。',
     ])
+    if settings['training']['stage'] == 'supervised':
+        weights = evaluation['proxy_task_weights']
+        lines.append('选模评分   : 三任务本地综合分（非官方）；'
+                     f'体制/调制/参数={weights["protocol"]:g}/{weights["modulation"]:g}/{weights["parameter"]:g}'
+                     '；参数=1/(1+七字段RMSE/训练std的均值)；best.pt取综合分最高。')
     if world > 1:
         lines.append('双卡显示   : 仅 rank 0 输出；进度条损失为 rank 0 本地统计。')
     lines.extend(['=' * 88, ''])
@@ -302,11 +330,16 @@ def epoch_summary(epoch, epochs, training, metrics, evaluated, improved, saved, 
             print(f"  验证 | mod_acc={classification['modulation']['accuracy']:.2%}"
                   f" | proto_acc={classification['protocol']['accuracy']:.2%}"
                   f" | param_proxy={metrics['parameter_proxy']:.4f}"
-                  f" | proxy_score={metrics['proxy_score']:.3f}（本地代理分）", flush=True)
+                  f" | proxy_score={metrics['proxy_score']:.3f}/100（本地综合近似分，非官方）", flush=True)
             if all('cross_entropy' in classification[task] for task in ['modulation', 'protocol']):
                 print(f"  验证损失 | mod_CE={classification['modulation']['cross_entropy']:.4f}"
                       f" | proto_CE={classification['protocol']['cross_entropy']:.4f}", flush=True)
             classification_summary(metrics)
+            for key,label in [('first14','前14类调制'),('qam','QAM组')]:
+                group=metrics.get('modulation_groups',{}).get(key)
+                if group:
+                    print(f"  {label} | Accuracy={group['accuracy']:.2%} | Macro-F1={group['macro_f1']:.2%}"
+                          f" | Weighted-F1={group['weighted_f1']:.2%} | 样本数={group['support']:,}",flush=True)
             values = ' | '.join(f"{name}={value['rmse']:.3e}" for name, value in metrics['parameters'].items() if value['rmse'] is not None)
             print(f'  参数 RMSE（原单位）| {values}', flush=True)
         print(f"  选择结果 | {'验证指标改善' if improved else '验证指标未改善'}", flush=True)

@@ -87,7 +87,7 @@ python code/infer.py --config code/configs/deployment/inference.json
 ## 预算、参数与恢复
 
 - 三份结构预训练配置沿用整理时用户的当前配方：768宽、12层、6头、Patch16、STFT64；80 epochs、每卡batch256、Atomic/Emergent各1，重建与谱权重0。第一轮新配置不是历史运行预算的精确复现。
-- 微调统一采用full全参策略：20轮、单卡batch256，头部峰值LR3e-4、基座3e-5，前3%线性预热后cosine至峰值5%；best.pt按调制准确率选择。详见[微调说明](finetuning.md)。
+- 微调统一采用full全参策略：20轮、单卡batch256，头部峰值LR3e-4、基座3e-5，前3%线性预热后cosine至峰值5%；best.pt按三任务本地综合分选择（体制30／调制30／参数40，非官方分）。详见[微调说明](finetuning.md)。
 - reconstruction.json保留原重建对照预算200 epochs；和结构路线做公平研究时，需要主动匹配训练预算及架构，不能直接按现有轮数比较。
 - 掩码默认比例0.3、跨度2、random策略；跨度为初始连续Token段长度。损失在遮挡且有效的位置计算，先按样本归一，再求均值。
 - 扩参时保持预训练与相应微调的encoder/signal和位置编码配置一致。当前supervised/main.json为384宽，与768宽预训练基座不能直接互载。

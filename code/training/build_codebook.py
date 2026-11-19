@@ -4,6 +4,7 @@
 only offline and is not needed by the final inference model.
 """
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -18,7 +19,10 @@ from utils.common import load_checkpoint, model_bundle, runtime, save_checkpoint
 from utils.dataset import PreparedDataset, collate, to_device
 from utils.command_config import command_defaults, checkpoint_reference, configured_launch
 from utils.structure import StructuralTokenizer, learn_merges
+from utils.structure import encode_emergent_chunk
 from utils.normalization import observation_scale
+from utils.multisource import balanced_source_positions
+from utils.structure_sampling import GROUP_NAMES,TARGET_WEIGHTS,validate_weights,token_plan
 
 
 @torch.inference_mode()
@@ -101,16 +105,25 @@ def main():
     p.add_argument('--cluster-initializations',type=int,default=5)
     p.add_argument('--bpe-tokens',type=int,default=0,help='Token budget overrides bpe-samples when positive')
     p.add_argument('--min-frequency',type=int,default=1,help='Stop BPE if best eligible pair is below this count')
+    p.add_argument('--sampling-policy',choices=['legacy','target_token_quota'],default='legacy')
+    p.add_argument('--group-weights',type=json.loads,default=TARGET_WEIGHTS)
+    p.add_argument('--precision',choices=['fp32','bf16'],default='fp32')
+    p.add_argument('--label-workers',type=int,default=0)
     command_defaults(p, {'run': {'data': 'data', 'output': 'output', 'teacher_checkpoint': 'teacher_checkpoint'},
                          'atomic': {'vocab_size': 'atomic_vocab', 'max_patches': 'max_patches', 'iterations': 'cluster_iterations', 'chunk_size': 'cluster_chunk_size',
                                     'metric':'metric','normalization':'normalization','amplitude_percentile':'amplitude_percentile',
                                     'batch_size':'cluster_batch_size','initializations':'cluster_initializations'},
                          'emergent': {'merges': 'merges', 'max_span': 'max_span', 'fit_sequences': 'bpe_samples','fit_tokens':'bpe_tokens','min_frequency':'min_frequency'},
-                         'runtime': {'batch_size': 'batch_size', 'seed': 'seed', 'device': 'device', 'threads': 'threads', 'gpus': 'gpus'}})
+                         'sampling':{'policy':'sampling_policy','group_weights':'group_weights'},
+                         'runtime': {'batch_size': 'batch_size', 'seed': 'seed', 'device': 'device', 'threads': 'threads', 'gpus': 'gpus','precision':'precision','label_workers':'label_workers'}})
     args = p.parse_args()
     if args.metric not in ['spherical','euclidean'] or args.normalization not in ['rms','amplitude_percentile']:
         p.error('Unknown dictionary distance or normalization')
     configured_launch(args.gpus)
+    if args.sampling_policy=='target_token_quota':
+        validate_weights(args.group_weights)
+        if args.bpe_tokens<=0:p.error('Target-token policy requires an explicit positive emergent.fit_tokens budget')
+    if not 0<=args.label_workers<=16:p.error('label_workers must be between 0 and 16')
     if args.teacher_checkpoint:
         args.teacher_checkpoint = checkpoint_reference(args.teacher_checkpoint)
     if args.atomic_vocab < 2 or args.merges < 0 or args.atomic_vocab + args.merges >= 65535 or args.max_span < 1 or args.cluster_iterations < 1 or args.bpe_samples < 1:
@@ -126,6 +139,9 @@ def main():
     if world != 1:
         raise ValueError('Build a codebook in one process')
     seed_all(args.seed)
+    def extract(batch):
+        with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=args.precision=='bf16'):
+            return features(to_device(batch,device),patch,teacher,args.metric,args.normalization,args.amplitude_percentile)
     train = PreparedDataset(args.data, 'train')
     info = train.info
     patch = info['patch_size']
@@ -143,23 +159,37 @@ def main():
     _, first = np.unique(train.meta['hash'][train.indices], return_index=True)
     unique_positions = first
     rng = np.random.default_rng(args.seed)
+    sampling_report={};fit_rows={}
     buckets = {}
     for position in unique_positions:
         row = train.indices[position]
-        key = (int(train.meta['task'][row]), int(train.meta['length'][row]))
+        key = (int(train.meta['source'][row]) if 'source' in train.meta else 0,
+               int(train.meta['task'][row]), int(train.meta['length'][row]))
         buckets.setdefault(key, []).append(int(position))
-    quota = max(1, args.max_patches // len(buckets))
+    if args.sampling_policy=='target_token_quota':
+        plan=token_plan(train,unique_positions,args.max_patches,args.group_weights,rng)
+        fit_rows['atomic_rows']=np.concatenate([train.indices[item['positions']] for item in plan])
+        sampling_report['atomic_tokens_by_group']={name:sum(item['quota'] for item in plan if item['key'][0]==i) for i,name in enumerate(GROUP_NAMES)}
+    else:
+        plan=[]
+        for key,positions in buckets.items():
+            source_buckets=sum(other[0]==key[0] for other in buckets)
+            quota=max(1,args.max_patches//len({k[0] for k in buckets})//source_buckets)
+            needed_rows=min(len(positions),(quota+key[2]//patch-1)//(key[2]//patch))
+            plan.append({'positions':rng.choice(positions,needed_rows,replace=False),'quota':quota,'key':key})
+            # Legacy RNG order included feature-position draws between buckets.
+            plan[-1]['feature_indices']=rng.choice(needed_rows*(key[2]//patch),min(quota,needed_rows*(key[2]//patch)),replace=False)
     pools = []
-    for key, positions in buckets.items():
-        needed_rows = min(len(positions), (quota + key[1] // patch - 1) // (key[1] // patch))
-        chosen = rng.choice(positions, needed_rows, replace=False)
+    for item in plan:
+        chosen=item['positions'];quota=item['quota']
         loader = DataLoader(Subset(train, chosen.tolist()), batch_size=args.batch_size, collate_fn=collate)
         vectors = []
         for batch in loader:
-            h, valid = features(to_device(batch, device), patch, teacher,args.metric,args.normalization,args.amplitude_percentile)
+            h, valid = extract(batch)
             vectors.append(h[valid].cpu())
         vectors = torch.cat(vectors)
-        indices = rng.choice(len(vectors), min(quota, len(vectors)), replace=False)
+        indices = item.get('feature_indices')
+        if indices is None:indices=rng.choice(len(vectors),min(quota,len(vectors)),replace=False)
         pools.append(vectors[indices])
     pool = torch.cat(pools)
     pool_size = len(pool)
@@ -173,31 +203,63 @@ def main():
     all_data = PreparedDataset(args.data, 'train')
     all_data.indices = np.arange(info['rows'])
     loader = DataLoader(all_data, batch_size=args.batch_size, collate_fn=collate)
-    for batch in loader:
-        h, valid = features(to_device(batch, device), patch, teacher,args.metric,args.normalization,args.amplitude_percentile)
+    for step,batch in enumerate(loader):
+        h, valid = extract(batch)
         assignment = assign_features(h,centers_device,args.metric).cpu().numpy()
         for i, row in enumerate(batch['rows']):
             length = int(batch['lengths'][i]) // patch
             atomic[row, :length] = assignment[i, :length]
+        if step%500==0:print(f'Atomic assignment batch {step+1:,}/{len(loader):,}',flush=True)
     atomic.flush()
     # Only TRAIN sequences fit BPE rules. Validation receives fixed-vocabulary labels.
-    if args.bpe_tokens:
+    if args.sampling_policy=='target_token_quota':
+        plan=token_plan(train,unique_positions,args.bpe_tokens,args.group_weights,rng)
+        sequences=[];fitting_rows=[];crop_starts=[];crop_lengths=[]
+        for item in plan:
+            remaining=item['quota']
+            for position in item['positions']:
+                row=int(train.indices[position]);count=min(item['tokens'],remaining)
+                start=int(rng.integers(item['tokens']-count+1)) if count<item['tokens'] else 0
+                sequences.append(np.asarray(atomic[row,start:start+count],dtype=np.int32))
+                fitting_rows.append(row);crop_starts.append(start);crop_lengths.append(count);remaining-=count
+            assert remaining==0
+        fitting_rows=np.asarray(fitting_rows,dtype=np.int64)
+        fit_rows.update(bpe_rows=fitting_rows,bpe_crop_starts=np.asarray(crop_starts),bpe_crop_lengths=np.asarray(crop_lengths))
+        sampling_report['bpe_tokens_by_group']={name:sum(item['quota'] for item in plan if item['key'][0]==i) for i,name in enumerate(GROUP_NAMES)}
+        sampling_report['weights']=args.group_weights
+        assert (train.meta['split'][fit_rows['atomic_rows']]==0).all() and (train.meta['split'][fitting_rows]==0).all()
+        np.savez_compressed(args.output/'fit_rows.npz',**fit_rows)
+        write_json(args.output/'sampling_report.json',sampling_report)
+    elif args.bpe_tokens:
         shuffled=rng.permutation(unique_positions)
         cumulative=np.cumsum(train.meta['length'][train.indices[shuffled]]//patch)
         fitting_positions=shuffled[:min(len(shuffled),int(np.searchsorted(cumulative,args.bpe_tokens))+1)]
     else:
-        fitting_positions = rng.choice(unique_positions, min(args.bpe_samples, len(unique_positions)), replace=False)
-    fitting_rows = train.indices[fitting_positions]
-    sequences = [np.asarray(atomic[row, :int(train.meta['length'][row]) // patch], dtype=np.int32) for row in fitting_rows]
-    if args.bpe_tokens and sum(map(len,sequences))>args.bpe_tokens:
-        sequences[-1]=sequences[-1][:(args.bpe_tokens-sum(map(len,sequences[:-1])))]
+        fitting_positions = balanced_source_positions(train,unique_positions,args.bpe_samples,rng)
+    if args.sampling_policy!='target_token_quota':
+        fitting_rows = train.indices[fitting_positions]
+        sequences = [np.asarray(atomic[row, :int(train.meta['length'][row]) // patch], dtype=np.int32) for row in fitting_rows]
+        if args.bpe_tokens and sum(map(len,sequences))>args.bpe_tokens:
+            sequences[-1]=sequences[-1][:(args.bpe_tokens-sum(map(len,sequences[:-1])))]
+    print(f'Fitting BPE on {len(sequences):,} training sequences',flush=True)
     merges, symbol_lengths = learn_merges(sequences, args.atomic_vocab, args.merges, args.max_span,args.min_frequency)
     tokenizer = StructuralTokenizer(merges)
     emergent = np.lib.format.open_memmap(args.output / 'emergent_labels.npy', mode='w+', dtype=np.uint16, shape=atomic.shape)
     emergent[:] = 65535
-    for row, length in enumerate(train.meta['length']):
-        count = int(length) // patch
-        emergent[row, :count] = tokenizer.encode(atomic[row, :count])
+    if args.label_workers:
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+        np.save(args.output/'lengths.npy',train.meta['length'])
+        emergent.flush()
+        jobs=[(str(args.output/'atomic_labels.npy'),str(args.output/'emergent_labels.npy'),str(args.output/'lengths.npy'),
+               patch,merges,start,min(info['rows'],start+50000)) for start in range(0,info['rows'],50000)]
+        with ProcessPoolExecutor(max_workers=args.label_workers,mp_context=multiprocessing.get_context('spawn')) as workers:
+            for end in workers.map(encode_emergent_chunk,jobs):print(f'Emergent assignment {end:,}/{info["rows"]:,}',flush=True)
+    else:
+        for row, length in enumerate(train.meta['length']):
+            count = int(length) // patch
+            emergent[row, :count] = tokenizer.encode(atomic[row, :count])
+            if row%100000==0:print(f'Emergent assignment {row+1:,}/{info["rows"]:,}',flush=True)
     emergent.flush()
     config = dict(dataset_fingerprint=info['fingerprint'], patch_size=patch, atomic_vocab=args.atomic_vocab,
         emergent_vocab=args.atomic_vocab + len(merges), requested_merges=args.merges, merges=merges,
@@ -209,6 +271,10 @@ def main():
         metric=args.metric,normalization=args.normalization,amplitude_percentile=args.amplitude_percentile,
         cluster_batch_size=args.cluster_batch_size,cluster_initializations=args.cluster_initializations,
         requested_bpe_tokens=args.bpe_tokens,fitted_training_tokens=sum(map(len,sequences)),min_frequency=args.min_frequency,
+        sampling_policy=args.sampling_policy,group_weights=args.group_weights if args.sampling_policy!='legacy' else {},
+        teacher_feature_precision=args.precision,sampling_report=sampling_report,
+        fitting_sequences_by_source={str(source):int((train.meta['source'][fitting_rows]==source).sum())
+           for source in np.unique(train.meta['source'])} if 'source' in train.meta else {},
         note='C01 adaptation with explicit sampling/normalization; no claim of bit-exact author-code reproduction.')
     # The artifact contains no live teacher dependency for training or inference.
     save_checkpoint(args.output / 'codebook.pt', {'centers': centers, 'config': config})

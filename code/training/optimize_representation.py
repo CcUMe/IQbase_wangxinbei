@@ -73,7 +73,7 @@ def main():
     config['data']['sampling'].update(mode='balanced', task_probabilities={'modulation': 1., 'protocol': 1., 'parameter': 1.})
     config['scheduler'].update(name='cosine', warmup_steps=min(200, args.steps // 10), warmup_ratio=0., min_lr_ratio=.05)
     config['runtime'].update(seed=args.seed, precision='bf16', log_every=50)
-    config['evaluation'].update(max_batches=0, batch_size=256, precision='fp32', selection_metric='modulation_accuracy')
+    config['evaluation'].update(max_batches=0, batch_size=256, precision='fp32', selection_metric='proxy_score')
     options = training_options(config)
     bundle['model_config'] = {**options['model'], 'pretrain_heads': False, 'contrastive_head': True}
     model = RFModel(**bundle).to(device)
@@ -102,21 +102,23 @@ def main():
         print(f'模型 | {model.parameter_report()} | source={args.checkpoint}')
         print(f'预算 | {config["training"]["epochs"]} epochs × {args.epoch_steps} steps | batch={args.batch_size} | cosine warmup={warmup}')
         print(f'增强 | {config["data"]["augmentation"]} | 初始权重 SHA256={state_hash.hexdigest()}')
-        print('验证 | 全部 118,182 条；最佳调制与最佳综合分检查点分别保存。')
+        print('验证 | 全验证集；best.pt按三任务本地综合分保存，best_modulation.pt仅作诊断。')
 
         def assess(epoch, training=None):
             nonlocal best_mod, best_overall
             metrics = evaluate(model, val_loader, device, bundle['target_scaler'], bundle['schema'], 'fp32')
             score = metrics['classification']['modulation']['accuracy']
-            improved = score > best_mod
+            modulation_improved = score > best_mod
             overall_improved = metrics['proxy_score'] > best_overall
+            improved = overall_improved
             best_mod, best_overall = max(best_mod, score), max(best_overall, metrics['proxy_score'])
             payload = dict(model=model.state_dict(), model_config=model.config, schema=bundle['schema'],
                 target_scaler=bundle['target_scaler'], parameter_grids=bundle['parameter_grids'],
                 dataset_fingerprint=train.info['fingerprint'], stage='supervised', training_config=config,
                 optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(), grad_scaler={}, codebook_signature=None,
                 world_size=1, epoch=max(0, epoch), batch_index=args.epoch_steps - 1 if epoch >= 0 else -1, epoch_complete=epoch >= 0,
-                global_step=global_step, best_score=best_mod, metrics=metrics,
+                global_step=global_step, best_score=best_overall, metrics=metrics,
+                selection={'metric': 'proxy_score', 'official': False},
                 initialization_source_steps=source['global_step'] + source.get('repair_source_steps', source.get('initialization_source_steps', 0)))
             save_checkpoint(args.output / 'last.pt', payload)
             if improved:
@@ -124,6 +126,8 @@ def main():
                 write_json(args.output / 'best_metrics.json', metrics)
             if overall_improved:
                 save_checkpoint(args.output / 'best_overall.pt', payload)
+            if modulation_improved:
+                save_checkpoint(args.output / 'best_modulation.pt', payload)
             write_json(args.output / 'metrics.json', metrics)
             write_json(args.output / f'metrics_step_{global_step:06d}.json', metrics)
             record = {'event': 'validation', 'epoch': epoch + 1, 'step': global_step, 'metrics': metrics,

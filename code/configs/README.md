@@ -2,6 +2,16 @@
 
 当前统一入口为 `python code/training/train.py --config <配置>`：
 
+2026-11-19参数读出候选：[`finetune/receiver_parameter_v1.json5`](finetune/receiver_parameter_v1.json5)、[`supervised/receiver_parameter_v1.json5`](supervised/receiver_parameter_v1.json5)、[`pretrain/receiver_parameter_v1.json5`](pretrain/receiver_parameter_v1.json5)共用原receiver_v1骨干，新增七项独立参数回归头、query统计及样点位置读出。监督/微调提高参数损失权重，并仅对纯参数记录加入50%整窗相位增强；best仍按三任务综合分选择。见[配置、启动和验证说明](../../docs/parameter_readout_v1.md)。尚无正式精度提升结论，旧运行与配置保留。
+
+2026-11-18定向第二轮：[`pretrain/refine_receiver_targeted_dual.json5`](pretrain/refine_receiver_targeted_dual.json5)使用固定第一轮教师重构词表，经审计后在GPU2、3执行第二轮50轮；构词及训练均提高C01前14类的Token份额。独立微调入口为[`finetune/receiver_targeted_round2.json5`](finetune/receiver_targeted_round2.json5)，原监督入口和共享骨干保留。详见[配额、启动及恢复](../../docs/receiver_targeted_round2.md)。
+
+2026-11-18第一轮迁移筛查：[`finetune/r1_comparison_gpu0.json5`](finetune/r1_comparison_gpu0.json5)在GPU0依次微调当前联合第一轮、旧C01第一轮固定权重；同架构、同任务头seed、单卡batch512，保留20轮调度并先限步到5轮。记录前14类Acc/F1、协议及七项参数指标，完成后自动写对照报告。详见[运行与恢复](../../docs/r1_finetune_comparison_gpu0.md)。
+
+2026-11-17联合数据候选：[`pretrain/two_rounds_p8_receiver_v1_mixed_dual.json5`](pretrain/two_rounds_p8_receiver_v1_mixed_dual.json5)使用C01＋RadioML联合词表，GPU2、3双卡50＋50轮后停止；独立C01微调用[`finetune/shared_base_p8_receiver_v1_mixed.json5`](finetune/shared_base_p8_receiver_v1_mixed.json5)，从头监督用[`supervised/shared_base_p8_receiver_v1_mixed.json5`](supervised/shared_base_p8_receiver_v1_mixed.json5)。三入口共享同一receiver_v1定义。数据划分和恢复见[联合预训练说明](../../docs/mixed_c01_radioml_pretraining.md)。
+
+2026-11-17接收前端v1候选：先使用[`supervised/shared_base_p8_receiver_v1.json5`](supervised/shared_base_p8_receiver_v1.json5)从头监督测试。新增复FIR与可迭代候选采样轨迹，以零初始化残差接入原P8共享基座；默认GPU0、batch256、20轮。三阶段配置已同时提供：[`pretrain/shared_base_p8_receiver_v1.json5`](pretrain/shared_base_p8_receiver_v1.json5)、[`pretrain/two_rounds_p8_receiver_v1.json5`](pretrain/two_rounds_p8_receiver_v1.json5)、[`pretrain/shared_base_p8_receiver_v1_round2.json5`](pretrain/shared_base_p8_receiver_v1_round2.json5)、[`finetune/shared_base_p8_receiver_v1.json5`](finetune/shared_base_p8_receiver_v1.json5)。本版尚无C01精度增益结论，旧配置保留。见[实现、参数及检查说明](../../docs/receiver_frontend_v1.md)。
+
 | 用途 | 正式配置 |
 | --- | --- |
 | P8从头监督 | [supervised/shared_base_p8.json5](supervised/shared_base_p8.json5) |
@@ -98,7 +108,7 @@ python code/training/train.py --config code/configs/finetune/round2_scratch.json
 | 第二轮继承 | artifacts/structure_research_01/codebook_v2 | logs/pretrain_v2 / logs/finetune_v2 | 第一轮基座，结构头重置 |
 | 第二轮随机初始化 | 同一份codebook_v2 | logs/pretrain_v2_scratch / logs/finetune_v2_scratch | 全模型随机初始化 |
 
-三个预训练配置的数值配方由整理时的当前配置复制；不声称还原历史第一轮预算。第二轮两种初始化方案保持相同模型、损失、学习率计划、预算和GPU安排，便于起步比较，最终仍需考虑各自适合的学习率。微调三份配置共用full全参策略：头部3e-4、基座3e-5、3%预热后cosine至5%、20轮。微调入口统一单卡、累积1次，有效batch256。best.pt按调制准确率选取。
+三个预训练配置的数值配方由整理时的当前配置复制；不声称还原历史第一轮预算。第二轮两种初始化方案保持相同模型、损失、学习率计划、预算和GPU安排，便于起步比较，最终仍需考虑各自适合的学习率。微调三份配置共用full全参策略：头部3e-4、基座3e-5、3%预热后cosine至5%、20轮。微调入口统一单卡、累积1次，有效batch256。best.pt按三任务本地综合分选取（体制30／调制30／参数40，非官方分）。
 
 日常监督训练：
 
@@ -267,7 +277,7 @@ cosine 按**优化器更新**调度：先线性预热，再余弦下降。在完
 
 `evaluation.every_epochs` 控制验证频率；最终轮及 max_steps 提前停止时强制验证。`batch_size / precision` 与训练独立；`max_batches=0` 表示全量，预训练验证批数以各实验配置为准，0表示全量。限制验证批数可能缺少部分任务，监督正式比较应保持 0。
 
-`selection_metric=auto` 时，监督训练按本地 proxy_score，预训练按最小预训练验证损失选 best。监督也可选 protocol_accuracy、modulation_accuracy 或 parameter_proxy。**预训练损失选 best 仍不能证明下游最好，需用真实标签微调后比较。** `mask_seed` 固定预训练验证遮挡，`proxy_task_weights` 只是本地代理指标权重，不补足官方尚未披露的参考尺度。
+`selection_metric=auto` 时，监督训练按本地 proxy_score，预训练按最小预训练验证损失选 best。监督和微调统一按综合分；旧单任务选模配置读入后升级为proxy_score。**预训练损失选 best 仍不能证明下游最好，需用真实标签微调后比较。** `mask_seed` 固定预训练验证遮挡，`proxy_task_weights` 只是本地代理指标权重，不补足官方尚未披露的参考尺度。
 
 `checkpoint.save_last / save_best / save_every_epochs` 分别控制最新、最佳和每 N 轮快照；`save_every_steps` 控制轮内覆盖最新检查点，间隔 0 关闭。关闭 save_last 也会关闭轮内定期保存。`resume_from` 控制恢复来源；保存设置可在严格续训时调整。改变训练配方应开始新实验；schema_version=2 的历史检查点可使用新增字段的缺省值恢复，更早的旧调度格式请用 init-checkpoint 或 warmstart-checkpoint 开始新实验。
 
@@ -289,7 +299,7 @@ cosine 按**优化器更新**调度：先线性预热，再余弦下降。在完
 
 `train.log` 是终端总览、定期进度、逐类验证表和收尾信息的可读文本，去掉进度条的回车重绘；事件保存在 `events.jsonl`。恢复历史运行时，如果原 `train.log` 是 JSON 行，将原样保留到 `train_legacy.jsonl`，重名时递增后缀，再建立新的可读日志。历史指标和记录不会删除。
 
-`evaluation.early_stopping`按selection_metric判断，patience=0关闭；开启时要求全量验证。min_delta使用指标的绝对单位，Accuracy下0.001代表0.1个百分点。早停计数随checkpoint恢复，不影响任何微小新高的best保存；当前金字塔入口patience=8。
+`evaluation.early_stopping`按selection_metric判断，patience=0关闭；开启时要求全量验证。min_delta使用指标的绝对单位，综合分下0.001表示0.001分。早停计数随checkpoint恢复，不影响任何微小新高的best保存；当前金字塔入口patience=8。
 
 ## 数据准备、词表与推理参数
 

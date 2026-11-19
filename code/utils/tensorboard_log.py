@@ -92,6 +92,10 @@ class TensorBoardLog:
                 self.scalar('train/step_statistics/' + key, parts.get(key), step)
             for name, value in event.get('learning_rates', {}).items():
                 self.scalar('train/learning_rate/' + name, value, step)
+            for name, value in event.get('receiver', {}).items():
+                self.scalar('frontend/receiver/' + name, value, step)
+            for name,value in event.get('source_rows',{}).items():
+                self.scalar('train/source_rows/'+name,value,step)
             norm = event.get('gradient_norm')
             self.scalar('train/gradient/norm_pre_clip', norm, step)
             if isinstance(norm, Real) and math.isfinite(norm):
@@ -128,13 +132,28 @@ class TensorBoardLog:
             result['parameters'][name] = {'rmse': value}
         if 'pretraining_validation_loss' in summary:
             result['pretraining_validation_loss'] = summary['pretraining_validation_loss']
+        if 'modulation_groups' in summary:result['modulation_groups']=summary['modulation_groups']
+        for key in ['pretraining_by_source','pretraining_by_group']:
+            if key in summary:result[key]=summary[key]
         return result
 
     def validation(self, metrics, step):
         self.scalar('validation/pretraining/loss', metrics.get('pretraining_validation_loss'), step)
+        for name,value in metrics.get('pretraining_by_source',{}).items():
+            self.scalar('validation/pretraining/'+name+'/loss',value,step)
+        for name,value in metrics.get('pretraining_by_group',{}).items():
+            self.scalar('validation/pretraining/group_'+name+'/loss',value,step)
         self.scalar('validation/rows', metrics.get('rows'), step)
+        for name,values in metrics.get('modulation_groups',{}).items():
+            for key,value in values.items():self.scalar('validation/modulation_groups/'+name+'/'+key,value,step)
         for key in ['proxy_score', 'parameter_proxy']:
             self.scalar('validation/local_proxy/' + key, metrics.get(key), step)
+        composite = metrics.get('local_composite', {})
+        self.scalar('validation/local_composite/total', metrics.get('proxy_score'), step)
+        for task, value in composite.get('components', {}).items():
+            self.scalar('validation/local_composite/component_' + task, value, step)
+        for field, value in composite.get('normalized_rmse', {}).items():
+            self.scalar('validation/local_composite/normalized_rmse/' + field, value, step)
         for task, values in metrics.get('classification', {}).items():
             for key in ['accuracy', 'micro_f1', 'macro_precision', 'macro_recall', 'macro_f1', 'weighted_f1',
                         'balanced_accuracy', 'cross_entropy', 'mean_confidence', 'support']:

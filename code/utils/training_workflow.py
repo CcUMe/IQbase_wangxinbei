@@ -47,6 +47,12 @@ class PipelineStop(BaseException):
         self.signum = signum
 
 
+def training_budget_complete(config,checkpoint):
+    cap=config['training'].get('max_steps',0)
+    return bool((cap and checkpoint['global_step']>=cap) or
+                (checkpoint['epoch_complete'] and checkpoint['epoch']+1>=config['training']['epochs']))
+
+
 def stamp():
     return datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y%m%d_%H%M%S_%f')
 
@@ -150,7 +156,8 @@ def prepare_stage_config(path,gpu,device):
     c=load_config(path)
     if c['training']['stage']=='pretrain':
         aug=c['data']['augmentation']
-        if aug['phase_rotation_probability'] or any(aug['modulation_only'][k] for k in ['phase_rotation_probability','circular_shift_probability']):
+        if (aug['phase_rotation_probability'] or aug.get('parameter_only',{}).get('phase_rotation_probability',0)
+                or any(aug['modulation_only'][k] for k in ['phase_rotation_probability','circular_shift_probability'])):
             raise ValueError('Pretraining structure targets require unaugmented IQ')
     if c['training']['max_steps']:raise ValueError('Use complete epoch budgets in the automatic pipeline')
     if c['checkpoint']['resume_from']:raise ValueError('Use pipeline --resume, not a config resume_from')
@@ -289,19 +296,26 @@ class Pipeline:
             run = latest_run(config['run']['output'])
         except FileNotFoundError:
             run = None
+        already_finished=False
         if run is not None and (run / 'last.pt').is_file():
-            args += ['--resume', str(run / 'last.pt')]
-        self.execute(stage, 'train.py', args)
+            previous=torch.load(run/'last.pt',map_location='cpu',weights_only=True,mmap=True)
+            already_finished=training_budget_complete(config,previous)
+            del previous
+            if not already_finished:args += ['--resume', str(run / 'last.pt')]
+        if not already_finished:self.execute(stage, 'train.py', args)
         run = latest_run(config['run']['output'])
         last = torch.load(run / 'last.pt', map_location='cpu', weights_only=True, mmap=True)
-        if not last['epoch_complete'] or last['epoch'] + 1 < config['training']['epochs']:
+        capped=config['training'].get('max_steps',0)
+        if not training_budget_complete(config,last):
             raise RuntimeError(stage + ' did not finish its configured epoch budget')
         best = run / 'best.pt'
         if not best.is_file():
             raise FileNotFoundError(best)
         self.manifest['stages'][stage] = {'complete': True, 'run_directory': str(run),
             'best_checkpoint': str(best), 'global_step': last['global_step'],
-            'epochs': config['training']['epochs'], 'initialization': config['run']['init_checkpoint'],
+            'epochs': last['epoch']+int(last['epoch_complete']),
+            'planned_epochs':config['training']['epochs'],'max_steps':capped,
+            'initialization': config['run']['init_checkpoint'],
             'codebook': config['run']['codebook']}
         del last
         self.save()
@@ -333,6 +347,9 @@ class Pipeline:
                          'fit_tokens':book.get('bpe_tokens',0),'min_frequency':book.get('min_frequency',1)},
             'runtime': {'batch_size': book['batch_size'], 'seed': book['seed'], 'threads': book['threads'],
                         'device': self.manifest['device'], 'gpus': self.manifest['gpu'].split(',')[0] if self.manifest['device'] != 'cpu' else ''}}
+        if 'sampling' in book:grouped['sampling']=book['sampling']
+        for key in ['precision','label_workers']:
+            if key in book:grouped['runtime'][key]=book[key]
         config_path = self.directory / 'codebook_round2_config.json'
         write_json(config_path, grouped)
         attempts = previous.get('attempts', []) + [str(output)]

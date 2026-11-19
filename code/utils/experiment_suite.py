@@ -11,6 +11,7 @@ import shutil
 import torch
 from utils.common import read_config_json, read_json, write_json
 from utils.config import load_config
+from utils.metrics import classification_group_metrics
 from utils.training_workflow import (ROOT, Pipeline, PipelineStop, absolute, digest,
                                      stamp, validate_devices)
 
@@ -38,9 +39,9 @@ def prepare_experiments(settings):
         cards = validate_devices(gpu, processes, c['runtime']['device'])
         if not set(cards).issubset(allowed):
             raise ValueError('Experiment GPU is outside suite runtime.gpus')
-        if (c['training']['max_steps'] or c['checkpoint']['resume_from'] or
+        if (c['checkpoint']['resume_from'] or
                 c['evaluation']['early_stopping']['patience']):
-            raise ValueError('Suite uses full fixed budgets; resume via the suite directory')
+            raise ValueError('Suite uses fixed epoch/update budgets; resume via the suite directory')
         if not c['checkpoint']['save_last'] or not c['checkpoint']['save_best']:
             raise ValueError('Suite needs last/best checkpoints')
         if c['evaluation']['max_batches']:
@@ -62,23 +63,29 @@ def write_comparison(directory, manifest):
         row = {'name': name, 'checkpoint': stage['best_checkpoint'],
                'checkpoint_sha256': digest(stage['best_checkpoint']),
                'epoch_1based': checkpoint['epoch'] + 1, 'step': checkpoint['global_step'],
+               'selection': checkpoint.get('selection', checkpoint.get('training_config', {}).get('evaluation', {})),
                'metrics': metrics}
+        last=torch.load(Path(stage['run_directory'])/'last.pt',map_location='cpu',weights_only=True,mmap=True)
+        row['endpoint']={'epoch_1based':last['epoch']+1,'step':last['global_step'],'metrics':last['metrics']}
+        row['validation_history']=[]
+        for line in (Path(stage['run_directory'])/'events.jsonl').read_text().splitlines():
+            event=json.loads(line)
+            if event.get('event')=='validation':
+                row['validation_history'].append({'epoch_1based':event['epoch']+1,'step':event['step'],'summary':event['summary']})
         mod = metrics.get('classification', {}).get('modulation')
         if mod:
             cm = mod['confusion_matrix']
             row['modulation_groups'] = {}
             for group, ids in [('first14', range(14)), ('last9', range(14, 23)),
                                ('qam', [4, 5, 6, 7, 12]), ('psk_related', [1, 2, 3, 8, 13])]:
-                support = sum(sum(cm[i]) for i in ids)
-                row['modulation_groups'][group] = {
-                    'support': support, 'accuracy': sum(cm[i][i] for i in ids) / max(support, 1)}
+                row['modulation_groups'][group]=classification_group_metrics(cm,ids)
         rows.append(row)
     write_json(directory / 'comparison.json', {
         'note': 'Matched supervised screening; single training seed, local development set, not official scores.',
         'completed': len(rows), 'experiments': rows})
     lines = ['# 独立精度实验', '', '各组依次执行；完整结果见comparison.json。', '',
-             '| 实验 | 最佳轮次 | 调制Acc | Macro-F1 | 前14类 | QAM | 协议Acc | 本地代理 |',
-             '|---|---:|---:|---:|---:|---:|---:|---:|']
+             '| 实验 | 最佳轮次 | 调制Acc | Macro-F1 | 前14类Acc | 前14类F1 | QAM | 协议Acc | 本地代理 |',
+             '|---|---:|---:|---:|---:|---:|---:|---:|---:|']
     for row in rows:
         m = row['metrics']
         if 'classification' not in m:
@@ -87,8 +94,10 @@ def write_comparison(directory, manifest):
         groups = row['modulation_groups']
         lines.append(f"| {row['name']} | {row['epoch_1based']} | {mod['accuracy']:.4%} | "
                      f"{mod['macro_f1']:.4%} | {groups['first14']['accuracy']:.4%} | "
+                     f"{groups['first14']['macro_f1']:.4%} | "
                      f"{groups['qam']['accuracy']:.4%} | {pro['accuracy']:.4%} | {m['proxy_score']:.4f} |")
-    lines += ['', '未完成组不作精度结论；best/last和全部七项参数误差保留在各组运行目录。']
+    lines += ['', '新运行按三任务本地综合分选择best（30/30/40，非官方分）；历史运行实际口径见comparison.json的selection。另存相同停止步数endpoint和逐轮验证历史。',
+              '未完成组不作精度结论；best/last和全部七项参数误差保留在各组运行目录。']
     (directory / 'comparison.md').write_text('\n'.join(lines) + '\n')
 
 

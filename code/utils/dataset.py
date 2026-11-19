@@ -14,8 +14,13 @@ class PreparedDataset(Dataset):
         self.info = read_json(self.directory / 'dataset.json')
         with np.load(self.directory / 'metadata.npz', allow_pickle=False) as f:
             self.meta = {key: f[key] for key in f.files}
+        self.pretrain_groups=None
+        if 'source' in self.meta:
+            from utils.structure_sampling import group_ids
+            self.pretrain_groups=group_ids(self.meta,np.arange(len(self.meta['length'])))
         self.indices = np.flatnonzero(self.meta['split'] == (0 if split == 'train' else 1))
         self.iq = None
+        self.source_handles = {}
         self.codebook_dir = Path(codebook_dir) if codebook_dir else None
         self.atomic = self.emergent = None
         if self.codebook_dir:
@@ -59,17 +64,35 @@ class PreparedDataset(Dataset):
     def __getstate__(self):
         state = self.__dict__.copy()
         state['iq'] = state['atomic'] = state['emergent'] = None
+        state['source_handles'] = {}
         return state
 
     def __getitem__(self, index):
         row = self.indices[index]
-        if self.iq is None:
-            self.iq = np.load(self.directory / 'iq.npy', mmap_mode='r')
         length = int(self.meta['length'][row])
-        result = {'iq': np.array(self.iq[row, :length], copy=True), 'length': length,
+        if self.info.get('storage') == 'multi_source':
+            source = int(self.meta['source'][row])
+            definition = self.info['sources'][source]
+            if source not in self.source_handles:
+                if definition['kind'] == 'npy':
+                    self.source_handles[source] = np.load(definition['path'], mmap_mode='r')
+                else:
+                    import h5py
+                    self.source_handles[source] = h5py.File(definition['path'], 'r')
+            handle = self.source_handles[source]
+            matrix = handle if definition['kind'] == 'npy' else handle['X']
+            iq = np.array(matrix[int(self.meta['source_row'][row]), :length], copy=True)
+        else:
+            if self.iq is None:
+                self.iq = np.load(self.directory / 'iq.npy', mmap_mode='r')
+            iq = np.array(self.iq[row, :length], copy=True)
+        result = {'iq': iq, 'length': length,
                   'modulation': self.meta['modulation'][row], 'protocol': self.meta['protocol'][row],
                   'targets': self.meta['targets'][row], 'target_valid': self.meta['target_valid'][row],
                   'sample_id': str(self.meta['sample_id'][row]), 'row': int(row)}
+        if 'source' in self.meta:
+            result['source_id']=int(self.meta['source'][row])
+            result['pretraining_group']=int(self.pretrain_groups[row])
         if self.codebook_dir:
             if self.atomic is None:
                 self.atomic = np.load(self.codebook_dir / 'atomic_labels.npy', mmap_mode='r')
@@ -96,6 +119,9 @@ def collate(batch):
             for i, row in enumerate(batch):
                 arr[i, :len(row[name])] = row[name]
             output[name] = torch.from_numpy(arr)
+    if 'source_id' in batch[0]:
+        output['source_ids']=torch.tensor([r['source_id'] for r in batch])
+        output['pretraining_groups']=torch.tensor([r['pretraining_group'] for r in batch])
     return output
 
 

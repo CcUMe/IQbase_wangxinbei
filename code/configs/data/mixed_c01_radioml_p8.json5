@@ -1,0 +1,13 @@
+// C01保持原划分；RadioML按内容哈希划分约95%/5%，保留全部原始I/Q。
+{
+  "run": {
+    "c01": "artifacts/data_full_p8",
+    "radioml": "/mnt/disk1/yangqilin/dataset/RadioML2018_01A/GOLD_XYZ_OSC.0001_1024.hdf5",
+    "output": "artifacts/data_c01_radioml_p8_v1"
+  },
+  "selection": {
+    "classes": ["OOK", "BPSK", "QPSK", "8PSK", "16QAM", "32QAM", "64QAM", "128QAM", "256QAM", "OQPSK"],
+    "minimum_snr_db": 0
+  },
+  "split": {"validation_fraction": 0.05, "seed": 20261117}
+}

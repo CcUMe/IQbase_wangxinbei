@@ -99,6 +99,17 @@ def load_with_training_aux(model, state, source_config=None):
         return model.load_state_dict(state, strict=True)
     current = model.state_dict()
     state = dict(state)
+    from models.tracked_receiver import receiver_options
+    receiver_prefix = 'backbone.receiver_frontend.'
+    source_receiver = (source_config.get('receiver_frontend', {}).get('enabled', False)
+                       if source_config is not None else any(k.startswith(receiver_prefix) for k in state))
+    target_receiver = model.config['receiver_frontend']['enabled']
+    if source_receiver and (not target_receiver or (source_config is not None and
+            receiver_options(source_config.get('receiver_frontend')) != model.config['receiver_frontend'])):
+        raise ValueError('Warmstart cannot discard or reinterpret trained receiver_frontend')
+    adding_receiver = target_receiver and not source_receiver
+    if adding_receiver:
+        with torch.no_grad():model.backbone.receiver_frontend.up.weight.zero_()
     from models.iq_geometry import iq_geometry_options
     geometry_prefix='backbone.iq_geometry.'
     source_geometry=(source_config.get('iq_geometry',{}).get('enabled',False) if source_config is not None
@@ -169,6 +180,8 @@ def load_with_training_aux(model, state, source_config=None):
         key.startswith('backbone.time.refinement.') for key in state)
     adding_refinement = model.config.get('local_refinement', False) and not source_refined
     allowed_missing = ('aux.contrastive.',)
+    if adding_receiver:
+        allowed_missing += (receiver_prefix,)
     if adding_geometry:
         allowed_missing += (geometry_prefix,)
     if adding_shift:

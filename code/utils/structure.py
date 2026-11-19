@@ -3,6 +3,17 @@ import heapq
 import numpy as np
 
 
+def encode_emergent_chunk(arguments):
+    """CPU-only spawned worker; disjoint output rows, no CUDA interaction."""
+    atomic_path,emergent_path,length_path,patch,merges,start,end=arguments
+    atomic=np.load(atomic_path,mmap_mode='r');emergent=np.load(emergent_path,mmap_mode='r+')
+    lengths=np.load(length_path,mmap_mode='r');tokenizer=StructuralTokenizer(merges)
+    for row in range(start,end):
+        count=int(lengths[row])//patch;emergent[row,:count]=tokenizer.encode(atomic[row,:count])
+    emergent.flush()
+    return end
+
+
 def learn_merges(sequences, atomic_vocab, number, max_span=5, min_frequency=1):
     if not sequences or any(not len(s) for s in sequences):raise ValueError('BPE requires nonempty sequences')
     if type(min_frequency) is not int or min_frequency<1:raise ValueError('BPE minimum frequency must be positive')

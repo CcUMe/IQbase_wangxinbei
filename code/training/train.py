@@ -21,6 +21,8 @@ from utils.initialization import load_pretrained_backbone
 from utils.augmentation import augment_supervised_iq
 from utils.common import load_checkpoint, log_json, read_json, runtime, save_checkpoint, seed_all, write_json
 from utils.dataset import BalancedBatchSampler, PreparedDataset, collate, to_device
+from utils.multisource import MultiSourceBatchSampler,validate_backbone_data_contract
+from utils.structure_sampling import TargetGroupBatchSampler,GROUP_NAMES
 from utils.engine import autocast, evaluate, evaluate_pretraining, patch_mask, pretraining_loss, supervised_loss
 from utils.config import load_config, make_scheduler, resolve_config, resume_comparison_config, training_options, validate_config
 from utils.training_display import EpochProgress, active_loss_parts, epoch_summary, training_overview, classification_summary
@@ -34,6 +36,8 @@ from utils.finetuning import FineTuneController
 from utils.process_lifecycle import managed_entrypoint
 from utils.early_stopping import EarlyStopping
 from utils.tensorboard_log import TensorBoardLog
+from utils.scoring import selection_score, selection_definition
+from utils.checkpoint_selection import migrate_best_selection
 
 
 def build_optimizer(model, settings, finetuning=None):
@@ -70,15 +74,6 @@ def loader_options(settings, device):
     if settings['num_workers']:
         result.update(persistent_workers=settings['persistent_workers'], prefetch_factor=settings['prefetch_factor'])
     return result
-
-
-def selection_score(metrics, name, stage):
-    name = ('pretraining_loss' if stage == 'pretrain' else 'proxy_score') if name == 'auto' else name
-    if name == 'pretraining_loss':
-        return -metrics['pretraining_validation_loss']
-    if name.endswith('_accuracy'):
-        return metrics['classification'][name.removesuffix('_accuracy')]['accuracy']
-    return metrics[name]
 
 
 def configure_checkpoint_start(args, settings):
@@ -205,9 +200,7 @@ def main():
         if model.multiresolution:
             raise ValueError('Multi-resolution pretraining adaptation is deferred; start supervised training without init-checkpoint')
         initial = load_checkpoint(args.init_checkpoint)
-        for key in ['dataset_fingerprint','schema','target_scaler','parameter_grids']:
-            expected=info['fingerprint'] if key=='dataset_fingerprint' else info[key]
-            if initial[key]!=expected:raise ValueError('Backbone initialization data contract mismatch: '+key)
+        validate_backbone_data_contract(initial,info)
         load_pretrained_backbone(model, initial)
         initialization_source_steps=initial['global_step']+initial.get('initialization_source_steps',0)
     report = model.parameter_report()
@@ -249,7 +242,7 @@ def main():
         global_step, best = previous['global_step'], previous['best_score']
         initialization_source_steps = previous.get('initialization_source_steps', previous.get('repair_source_steps', 0))
         metrics = previous['metrics']
-        best_metrics = previous.get('best_metrics', best_metrics)
+        best_metrics = {**best_metrics, **previous.get('best_metrics', {})}
         validation_global_step = previous.get('validation_global_step')
         epoch_start = previous['epoch'] + int(previous['epoch_complete'])
         batch_start = 0 if previous['epoch_complete'] else previous['batch_index'] + 1
@@ -274,6 +267,14 @@ def main():
     sampling = resolved['data']['sampling']
     sampler = BalancedBatchSampler(train_data, config['batch_size'], steps * accumulation, config['seed'], rank,
                                    sampling['mode'], sampling['task_probabilities'])
+    if sampling['target_groups']['enabled']:
+        sampler=TargetGroupBatchSampler(train_data,config['batch_size'],steps*accumulation,
+              sampling['target_groups']['weights'],config['seed'],rank)
+    elif sampling['multi_source']['enabled']:
+        sampler=MultiSourceBatchSampler(train_data,config['batch_size'],steps*accumulation,
+                                       sampling['multi_source'],config['seed'],rank)
+    elif info.get('storage')=='multi_source' and args.stage=='pretrain':
+        raise ValueError('Mixed pretraining requires a source-aware sampler; otherwise unlabeled IQ is excluded')
     loader = DataLoader(train_data, batch_sampler=sampler, collate_fn=collate, **loader_options(resolved['data']['loader'], device))
     val_loader = DataLoader(val_data, batch_size=resolved['evaluation']['batch_size'], collate_fn=collate,
                             **loader_options(resolved['data']['loader'], device))
@@ -287,12 +288,30 @@ def main():
         return DistributedDataParallel(module, **ddp_options)
     model = wrap_ddp()
     args.output = training_run_directory(args.output, args.resume, rank, world)
+    selection = selection_definition(args.stage, resolved['evaluation'])
+    selection_migration = None
+    needs_selection_validation = False
     with ExitStack() as resources:
         run_log = resources.enter_context(ReadableRunLog(args.output)) if rank == 0 else None
         tb = resources.enter_context(TensorBoardLog(args.output, resolved['logging']['tensorboard'],
             log_every=config['log_every'], rank=rank, resume_step=global_step if args.resume else None,
             gradient_clip=config['gradient_clip']))
         if rank == 0:
+            if previous and args.stage == 'supervised':
+                selection_migration = migrate_best_selection(args.output, previous, resolved['evaluation'], info['target_scaler'])
+                if selection_migration:
+                    best = selection_migration['best_score']
+                    needs_selection_validation = best is None
+                    best = -float('inf') if best is None else best
+                    best_metrics['proxy'] = best
+                    early_stopping = EarlyStopping(resolved['evaluation']['early_stopping'])
+                    if math.isfinite(best):
+                        early_stopping.best = best
+                    log_json(args.output / 'events.jsonl', dict(event='selection_migration', step=global_step,
+                        **selection_migration), console=False)
+                    print(f'选模策略迁移 | {selection_migration["previous_selection"]["metric"]} → proxy_score'
+                          f' | 历史文件保留于 {selection_migration["archive"]}'
+                          f' | 新best={best if math.isfinite(best) else "待完整验证"}', flush=True)
             write_json(args.output / 'resolved_config.json', resolved)
             write_json(args.output / 'parameter_report.json', report)
             log_json(args.output / 'events.jsonl', dict(event='start', stage=args.stage, step=global_step, epoch=epoch_start,
@@ -300,6 +319,7 @@ def main():
                         train_rows=len(train_data), validation_rows=len(val_data), steps_per_epoch=steps, parameters=report,
                         gradient_accumulation_steps=accumulation, effective_batch_size=config['batch_size'] * world * accumulation,
                         scheduler=resolved['scheduler'], resolved_warmup_steps=warmup, planned_optimizer_updates=total, max_steps=cap,
+                        selection=selection,
                         finetuning_state=fine.state(global_step) if fine else None,
                         initialization={'resume': str(args.resume) if args.resume else None,
                                         'backbone': str(args.init_checkpoint) if args.init_checkpoint else None,
@@ -319,10 +339,12 @@ def main():
             return dict(model=module.state_dict(), model_config=module.config, schema=info['schema'],
                 target_scaler=info['target_scaler'], parameter_grids=info['parameter_grids'],
                 dataset_fingerprint=info['fingerprint'], stage=args.stage, optimizer=optimizer.state_dict(),
+                data_provenance=info.get('data_provenance',{}),
                 codebook_signature=codebook_signature, scheduler=scheduler.state_dict(),
                 grad_scaler=grad_scaler.state_dict(), training_config=resolved, world_size=world,
                 epoch=epoch, batch_index=batch_index, epoch_complete=epoch_complete, global_step=global_step,
                 best_score=best, metrics=metrics, validation_global_step=validation_global_step,
+                selection=selection,
                 best_metrics=best_metrics,
                 early_stopping=early_stopping.state_dict(),
                 finetuning_state=fine.state(global_step) if fine else None,
@@ -337,8 +359,16 @@ def main():
             if rank == 0:
                 print(f'验证中 | epoch {epoch + 1} | step {global_step:,} | {trigger}', flush=True)
                 if args.stage == 'pretrain':
-                    value = evaluate_pretraining(module, val_loader, device, config, codebook, resolved['evaluation']['max_batches'])
-                    metrics = {'pretraining_validation_loss': value}
+                    value = evaluate_pretraining(module, val_loader, device, config, codebook, resolved['evaluation']['max_batches'],
+                                                 details=info.get('storage')=='multi_source')
+                    metrics = {'pretraining_validation_loss': value['loss'] if isinstance(value,dict) else value}
+                    if isinstance(value,dict):
+                        metrics['pretraining_by_source']={info['sources'][k]['name']:v for k,v in value['by_source'].items()}
+                        print('分来源验证 | '+ ' | '.join(f'{k}={v:.5f}' for k,v in metrics['pretraining_by_source'].items()),flush=True)
+                        metrics['pretraining_by_group']={GROUP_NAMES[k]:v for k,v in value.get('by_group',{}).items()}
+                        if 'c01_first14' in metrics['pretraining_by_group']:
+                            metrics['pretraining_c01_first14_loss']=metrics['pretraining_by_group']['c01_first14']
+                        print('分组结构验证 | '+' | '.join(f'{k}={v:.5f}' for k,v in metrics['pretraining_by_group'].items()),flush=True)
                 else:
                     metrics = evaluate(module, val_loader, device, info['target_scaler'], info['schema'],
                         resolved['evaluation']['precision'], resolved['evaluation']['max_batches'],
@@ -369,12 +399,26 @@ def main():
                     else {'classification_accuracy': {k:v['accuracy'] for k,v in metrics['classification'].items()},
                           'classification_f1': {k:{'macro_f1':v['macro_f1'],'weighted_f1':v['weighted_f1']} for k,v in metrics['classification'].items()},
                           'parameter_rmse': {k:v['rmse'] for k,v in metrics['parameters'].items()}})
+                if args.stage == 'supervised':
+                    summary.update(proxy_score=metrics['proxy_score'], parameter_proxy=metrics['parameter_proxy'],
+                                   local_composite=metrics['local_composite'])
+                if 'pretraining_by_source' in metrics:summary['pretraining_by_source']=metrics['pretraining_by_source']
+                for key in ['pretraining_by_group','pretraining_c01_first14_loss']:
+                    if key in metrics:summary[key]=metrics[key]
+                if 'modulation_groups' in metrics:summary['modulation_groups']=metrics['modulation_groups']
                 validation_event = dict(event='validation', epoch=epoch, step=global_step,
                     trigger=trigger, score=score, best=best, improved=improved,
+                    selection=selection,
                     summary=summary, early_stopping=early_stopping.state_dict(),
                     finetuning_state=fine.state(global_step) if fine else None)
                 log_json(args.output / 'events.jsonl', validation_event, console=False)
                 tb.record(validation_event, metrics)
+                if args.stage == 'supervised':
+                    parts = metrics['local_composite']['components']
+                    print(f'综合选模（本地近似，非官方分）| 总分={score:.6f}/100'
+                          f' | 体制={parts["protocol"]:.4f} | 调制={parts["modulation"]:.4f}'
+                          f' | 参数={parts["parameter"]:.4f} | best={best:.6f}'
+                          f' | {"保存新best" if improved else "保留原best"}', flush=True)
                 if early_stop_requested:
                     print(f'提前停止 | 连续 {early_stopping.bad_validations} 次完整验证未达到最小改善 '
                           f'{early_stopping.min_delta:g} | selection={resolved["evaluation"]["selection_metric"]}', flush=True)
@@ -394,6 +438,12 @@ def main():
             else:
                 module.train()
 
+        if world > 1:
+            flag = torch.tensor(int(needs_selection_validation), device=device)
+            dist.broadcast(flag, src=0)
+            needs_selection_validation = bool(flag.item())
+        if needs_selection_validation:
+            assess(previous['epoch'], previous['batch_index'], previous['epoch_complete'], 'selection_migration')
         started, stop = time.monotonic(), False
         for epoch in range(epoch_start, config['epochs']):
             sampler.set_epoch(epoch)
@@ -435,6 +485,11 @@ def main():
                     if batch_index % accumulation == 0:
                         update_active_heads = set()
                         update_active_parts = set()
+                        update_sources = {}
+                    if 'source_ids' in batch:
+                        for source,count in zip(*torch.unique(batch['source_ids'],return_counts=True)):
+                            name=info['sources'][int(source)]['name']
+                            update_sources[name]=update_sources.get(name,0)+int(count)
                     if config['skip_inactive_heads']:
                         update_active_heads.update(active_heads(batch, config))
                     batch = to_device(batch, device)
@@ -494,6 +549,10 @@ def main():
                             step_event = dict(event='step', epoch=epoch, step=global_step, loss=update_loss,
                                 parts=update_parts, gradient_norm=float(norm), lr=next(iter(used_rates.values())), learning_rates=used_rates,
                                 active_parts=sorted(update_active_parts), elapsed_seconds=time.monotonic() - started)
+                            receiver = getattr(module.backbone, 'receiver_frontend', None)
+                            if update_sources:step_event['source_rows']=update_sources
+                            if receiver is not None:
+                                step_event['receiver'] = {key: float(value) for key, value in receiver.last_diagnostics.items()}
                             if write_event:
                                 log_json(args.output / 'events.jsonl', step_event, console=False)
                             tb.record(step_event)
@@ -572,6 +631,10 @@ def cli():
         if raw.get('workflow') == 'experiment_suite':
             from utils.experiment_suite import run_suite
             run_suite()
+            return
+        if raw.get('workflow')=='refine_pretrain':
+            from utils.refined_pretraining import run_refined
+            run_refined()
             return
         if 'workflow' in raw or ('round1' in raw and 'round2' in raw):
             if raw.get('workflow','two_round_pretrain')!='two_round_pretrain':

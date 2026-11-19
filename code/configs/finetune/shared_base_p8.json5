@@ -143,7 +143,7 @@
     "head_warmup_steps": 0,
     "upper_layers_steps": 0,
     "unfreeze_last_n_blocks": 4,
-    "layer_lr_decay": 1.0,
+    "layer_lr_decay": 0.9,
     "frontend_lr_factor": 1.0,
     "anchor_weight": 0.0,
     "validation_every_steps": 0,
@@ -187,7 +187,7 @@
         "temperature": 0.1,
         "gather_distributed": true
       },
-      "label_smoothing": 0.0,
+      "label_smoothing": 0.05,
       "regression": "mse",
       "huber_delta": 1.0,
       "parameter_weights": {
@@ -226,7 +226,7 @@
     "max_batches": 0,
     "precision": "fp32",
     "mask_seed": 12345,
-    "selection_metric": "modulation_accuracy",
+    "selection_metric": "proxy_score",
     "early_stopping": {
       "patience": 0,
       "min_delta": 0.001
@@ -252,8 +252,8 @@
   // 默认物理GPU0单卡、BF16；双卡时设gpus="2,3"、processes=2并将每卡batch改为128。
   "runtime": {
     "device": "auto",
-    "gpus": "3",
-    "processes": 1,
+    "gpus": "2, 3",
+    "processes": 2,
     "precision": "bf16",
     "seed": 20261115,
     "threads": 4,

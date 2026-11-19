@@ -4,6 +4,7 @@ from models.iq_geometry import iq_geometry_options
 from models.patch_shift import patch_shift_options
 from models.density_encoding import density_options
 from utils.position import POSITION_DEFAULTS
+from models.tracked_receiver import receiver_options
 
 
 def load_pretrained_backbone(model,checkpoint):
@@ -22,7 +23,8 @@ def load_pretrained_backbone(model,checkpoint):
     allowed=[]
     for name,normalize,prefix in [('iq_geometry',lambda x:iq_geometry_options(x,new['patch_size']),'iq_geometry.'),
                                   ('patch_shift',lambda x:patch_shift_options(x,new['patch_size']),'patch_shift.'),
-                                  ('density_encoding',density_options,'time.density.')]:
+                                  ('density_encoding',density_options,'time.density.'),
+                                  ('receiver_frontend',receiver_options,'receiver_frontend.')]:
         before=normalize(old.get(name));after=normalize(new.get(name))
         if before['enabled'] and before!=after:
             raise ValueError('Pretrained backbone cannot discard or reinterpret '+name)

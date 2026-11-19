@@ -13,6 +13,9 @@ from models.phase_relations import PHASE_RELATION_DEFAULTS, phase_relation_optio
 from models.density_encoding import DENSITY_DEFAULTS,density_options
 from models.patch_shift import PATCH_SHIFT_DEFAULTS, patch_shift_options
 from models.iq_geometry import IQ_GEOMETRY_DEFAULTS, iq_geometry_options
+from models.tracked_receiver import RECEIVER_DEFAULTS, receiver_options
+from utils.structure_sampling import TARGET_WEIGHTS,validate_weights
+from models.parameter_readout import PARAMETER_READOUT_DEFAULTS, parameter_readout_options
 
 
 DEFAULTS = {
@@ -29,7 +32,7 @@ DEFAULTS = {
                    'normalization': 'rms', 'amplitude_percentile': 99.0,
                    'position_options': deepcopy(POSITION_DEFAULTS),
                    'scale_embedding': True, 'global_spectrum_input': True, 'multiscale_frontend': False},
-        'heads': {'parameter_mode': 'regression', 'classification_hidden_ratio': 0.5,
+        'heads': {'parameter_mode': 'regression', 'parameter_readout': deepcopy(PARAMETER_READOUT_DEFAULTS), 'classification_hidden_ratio': 0.5,
                   'grid_residual_scale': 0.1, 'parameter_query_temperature': 1.0, 'contrastive_projection_dim': 128,
                   'classification_pooling': 'mean', 'physical_statistics': False, 'classification_fp32': False,
                   'multiscale_readout': deepcopy(READOUT_DEFAULTS),
@@ -42,12 +45,16 @@ DEFAULTS = {
         'density_encoding':deepcopy(DENSITY_DEFAULTS),
         'patch_shift': deepcopy(PATCH_SHIFT_DEFAULTS),
         'iq_geometry': deepcopy(IQ_GEOMETRY_DEFAULTS),
+        'receiver_frontend': deepcopy(RECEIVER_DEFAULTS),
     },
     'data': {'batch_size': 128, 'steps_per_epoch': 0, 'merge_paired': False,
              'augmentation': {'phase_rotation_probability': 0.0,
+                              'parameter_only': {'phase_rotation_probability': 0.0},
                               'modulation_only': {'phase_rotation_probability': 0.0, 'circular_shift_probability': 0.0,
                                                   'class_indices': [], 'apply_probability': 1.0}},
-             'sampling': {'mode': 'balanced', 'task_probabilities': {'modulation': 1.0, 'protocol': 1.0, 'parameter': 1.0}},
+             'sampling': {'mode': 'balanced', 'task_probabilities': {'modulation': 1.0, 'protocol': 1.0, 'parameter': 1.0},
+                          'multi_source': {'enabled':False,'probabilities':{'c01':.7,'radioml':.3}},
+                          'target_groups':{'enabled':False,'weights':deepcopy(TARGET_WEIGHTS)}},
              'loader': {'num_workers': 2, 'pin_memory': True, 'persistent_workers': False, 'prefetch_factor': 2}},
     'training': {'stage': 'supervised', 'epochs': 30, 'max_steps': 0,
                  'gradient_accumulation_steps': 1, 'gradient_clip': 1.0},
@@ -125,10 +132,11 @@ def legacy_config(raw):
     for key, value in raw.items():
         if key == 'model':
             for name, option in value.items():
-                if name in ['pyramid', 'hierarchy', 'hybrid', 'mid_fusion', 'phase_relations','density_encoding', 'patch_shift', 'iq_geometry']:
+                if name in ['pyramid', 'hierarchy', 'hybrid', 'mid_fusion', 'phase_relations','density_encoding', 'patch_shift', 'iq_geometry', 'receiver_frontend']:
                     template = {'pyramid': PYRAMID_DEFAULTS, 'hierarchy': HIERARCHY_DEFAULTS, 'hybrid': HYBRID_DEFAULTS,
                                 'mid_fusion': MID_FUSION_DEFAULTS, 'phase_relations': PHASE_RELATION_DEFAULTS,'density_encoding':DENSITY_DEFAULTS,
-                                'patch_shift': PATCH_SHIFT_DEFAULTS,'iq_geometry':IQ_GEOMETRY_DEFAULTS}[name]
+                                'patch_shift': PATCH_SHIFT_DEFAULTS,'iq_geometry':IQ_GEOMETRY_DEFAULTS,
+                                'receiver_frontend':RECEIVER_DEFAULTS}[name]
                     result['model'][name] = merge_known(template, option, f'model.{name}')
                     continue
                 groups = [group for group in ['encoder', 'signal', 'heads'] if name in result['model'][group]]
@@ -151,6 +159,12 @@ def legacy_config(raw):
 
 def resolve_config(raw):
     config = merge_known(DEFAULTS, raw) if 'schema_version' in raw else legacy_config(raw)
+    # All three-task training uses a single primary criterion, including old
+    # user configs/checkpoints that explicitly requested modulation-only best.
+    if (config['training']['stage'] == 'supervised' and
+            config['evaluation']['selection_metric'] in
+            ['modulation_accuracy', 'protocol_accuracy', 'parameter_proxy']):
+        config['evaluation']['selection_metric'] = 'proxy_score'
     validate_config(config)
     return config
 
@@ -165,6 +179,11 @@ def resume_comparison_config(config):
     result.pop('checkpoint', None)
     result.pop('run', None)
     result.pop('logging', None)  # Visualization never changes the training recipe.
+    # Saving policy may change without restarting AdamW or the LR schedule.
+    # train.py separately archives/rebases best and resets early-stopping state.
+    if result['training']['stage'] == 'supervised':
+        result['evaluation'].pop('selection_metric', None)
+        result['evaluation'].pop('proxy_task_weights', None)
     result['training'].pop('max_steps', None)  # Stop cap never changes the planned LR schedule.
     for key in ['progress_bar', 'progress_min_interval', 'gpus', 'processes']:
         result['runtime'].pop(key, None)
@@ -178,7 +197,8 @@ def model_options(c):
               'phase_relations': deepcopy(c['model']['phase_relations']),
               'density_encoding':deepcopy(c['model']['density_encoding']),
               'patch_shift': deepcopy(c['model']['patch_shift']),
-              'iq_geometry':deepcopy(c['model']['iq_geometry'])}
+              'iq_geometry':deepcopy(c['model']['iq_geometry']),
+              'receiver_frontend':deepcopy(c['model']['receiver_frontend'])}
     if result['hierarchy']['enabled']:
         validate_hierarchy(result['hierarchy'], result['multiscale_readout'])
     if result['hierarchy']['enabled'] and not result['hybrid']['enabled']:
@@ -216,6 +236,12 @@ def validate_config(c):
     density_options(m['density_encoding'])
     patch_shift_options(m['patch_shift'], m['patch_size'])
     iq_geometry_options(m['iq_geometry'],m['patch_size'])
+    receiver_options(m['receiver_frontend'])
+    require(not m['receiver_frontend']['enabled'] or not (
+        m['pyramid']['enabled'] or m['hierarchy']['enabled'] or m['hybrid']['enabled'] or
+        m['patch_shift']['enabled'] or m['density_encoding']['enabled'] or
+        m['local_refinement'] or m['multiscale_frontend']),
+        'receiver_frontend requires the single shared frontend; iq_geometry is compatible')
     require(not m['iq_geometry']['enabled'] or not (
         m['pyramid']['enabled'] or m['hierarchy']['enabled'] or m['hybrid']['enabled'] or
         m['patch_shift']['enabled'] or m['density_encoding']['enabled'] or
@@ -230,6 +256,13 @@ def validate_config(c):
     require(not m['modulation_temporal']['enabled'] or m['pyramid']['enabled'],
             'modulation_temporal currently requires the pyramid backbone')
     d, t, o, s, e, r = (c[key] for key in ['data', 'training', 'optimizer', 'scheduler', 'evaluation', 'runtime'])
+    source=d['sampling']['multi_source']
+    require(all(type(v) in [int,float] and v>0 for v in source['probabilities'].values()),
+            'Source probabilities must be positive finite numbers')
+    require(not source['enabled'] or t['stage']=='pretrain','Multi-source unlabeled sampling is for pretraining only')
+    target=d['sampling']['target_groups'];validate_weights(target['weights'])
+    require(not target['enabled'] or (t['stage']=='pretrain' and not source['enabled']),
+            'Target-group pretraining sampling replaces multi_source sampling and requires pretrain stage')
     require(type(r['seed']) is int and r['seed'] >= 0 and type(e['mask_seed']) is int and e['mask_seed'] >= 0, 'Seeds must be nonnegative integers')
     require(r['progress_min_interval'] >= 0, 'progress_min_interval must be nonnegative')
     for key, value in {'width': m['width'], 'depth': m['depth'], 'heads': m['heads'], 'patch_size': m['patch_size'],
@@ -256,6 +289,9 @@ def validate_config(c):
             'Current dataset has no sampling-rate metadata; physical mode requires a real constant sample_rate_hz at train and inference')
     require(m['spectral_backend'] in ['fft', 'matmul'], 'spectral_backend must be fft or matmul')
     require(m['parameter_mode'] in ['regression', 'grid_residual'], 'Unknown parameter_mode')
+    parameter_options = parameter_readout_options(m['parameter_readout'])
+    require(not parameter_options['enabled'] or not (c['model']['pyramid']['enabled'] or c['model']['hierarchy']['enabled']),
+            'parameter_readout requires the shared token backbone')
     require(type(m['contrastive_projection_dim']) is int and m['contrastive_projection_dim'] > 0, 'contrastive_projection_dim must be a positive integer')
     require(m['classification_pooling'] in ['mean', 'mean_std', 'multiscale_attention_stats'], 'Unknown classification_pooling')
     pyramid = c['model']['pyramid']
@@ -319,6 +355,8 @@ def validate_config(c):
         require(f['head_warmup_steps'] + f['upper_layers_steps'] > 0, 'gradual strategy requires a nonempty frozen phase')
     require(d['sampling']['mode'] in ['balanced', 'weighted', 'proportional'], 'Unknown sampling mode')
     require(0 <= d['augmentation']['phase_rotation_probability'] <= 1, 'phase_rotation_probability must be in [0,1]')
+    require(0 <= d['augmentation']['parameter_only']['phase_rotation_probability'] <= 1,
+            'parameter_only.phase_rotation_probability must be in [0,1]')
     modulation_augmentation = d['augmentation']['modulation_only']
     require(all(0 <= modulation_augmentation[key] <= 1 for key in ['phase_rotation_probability','circular_shift_probability','apply_probability']), 'modulation_only augmentation probabilities must be in [0,1]')
     indices=modulation_augmentation['class_indices']
@@ -332,6 +370,8 @@ def validate_config(c):
     for name, weights in [('task_weights', u['task_weights']), ('parameter_weights', u['parameter_weights']),
                           ('pretraining.weights', p['weights']), ('proxy_task_weights', e['proxy_task_weights'])]:
         require(all(math.isfinite(x) and x >= 0 for x in weights.values()) and sum(weights.values()) > 0, f'Invalid {name}')
+    require(math.isclose(sum(e['proxy_task_weights'].values()), 100., abs_tol=1e-8),
+            'proxy_task_weights must sum to 100; default preliminary-round weights are 30/30/40')
     require(u['grid_weight'] >= 0 and type(p['mask']['span']) is int and p['mask']['span'] > 0, 'Invalid grid weight/mask')
     if p['mask']['strategy']=='bernoulli_starts':
         require(p['mask']['ratio']==0 and 0<p['mask']['start_probability']<1, 'Bernoulli start masking requires ratio=0 and an explicit start_probability')
@@ -339,8 +379,8 @@ def validate_config(c):
         require(0<p['mask']['ratio']<1 and p['mask']['start_probability']==0, 'Fixed-ratio masking requires ratio in (0,1) and start_probability=0')
     require(p['mask']['strategy'] in ['random', 'energy_mixed','bernoulli_starts'] and 0 <= p['mask']['energy_fraction'] <= 1 and p['mask']['energy_floor'] > 0, 'Invalid energy masking')
     require(p['reduction'] in ['per_record','masked_token_mean'], 'Unknown pretraining reduction')
-    require(e['selection_metric'] in ['auto', 'proxy_score', 'protocol_accuracy', 'modulation_accuracy', 'parameter_proxy', 'pretraining_loss'], 'Unknown selection_metric')
-    require(e['selection_metric'] == 'auto' or (t['stage'] == 'pretrain') == (e['selection_metric'] == 'pretraining_loss'), 'Selection metric is incompatible with training stage')
+    require(e['selection_metric'] in ['auto', 'proxy_score', 'protocol_accuracy', 'modulation_accuracy', 'parameter_proxy', 'pretraining_loss','pretraining_c01_first14_loss'], 'Unknown selection_metric')
+    require(e['selection_metric'] == 'auto' or (t['stage'] == 'pretrain') == (e['selection_metric'] in ['pretraining_loss','pretraining_c01_first14_loss']), 'Selection metric is incompatible with training stage')
     early = e['early_stopping']
     require(type(early['patience']) is int and early['patience'] >= 0 and early['min_delta'] >= 0,
             'Invalid early_stopping patience/min_delta')

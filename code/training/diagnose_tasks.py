@@ -15,7 +15,8 @@ from torch.utils.data import DataLoader
 from models.rf_model import RFModel
 from training.train import build_optimizer
 from utils.common import model_bundle, log_json, runtime, seed_all, save_checkpoint, write_json, read_json
-from utils.config import resolve_config, training_options, make_scheduler
+from utils.config import resolve_config, training_options, make_scheduler, resume_comparison_config
+from utils.checkpoint_selection import migrate_best_selection
 from utils.dataset import BalancedBatchSampler, PreparedDataset, collate, to_device
 from utils.engine import autocast, evaluate, supervised_loss
 from utils.head_optimizer import active_heads, clear_inactive_head_gradients
@@ -142,6 +143,10 @@ def main():
     if args.resume:
         previous_protocol = read_json(args.output / 'protocol.json')
         for key in protocol:
+            if (key == 'training_config_reference' and
+                    resume_comparison_config(resolve_config(previous_protocol[key])) ==
+                    resume_comparison_config(resolve_config(protocol[key]))):
+                continue
             if key != 'modulation_batch_stream_sha256' and previous_protocol[key] != protocol[key]:
                 raise ValueError(f'Resume protocol changed: {key}')
         previous = torch.load(args.resume, map_location='cpu', weights_only=True, mmap=True)
@@ -153,6 +158,10 @@ def main():
         start_epoch, start_cycle = previous['epoch'] + 1, previous['modulation_updates']
         history = previous['history'] if 'history' in previous else read_json(args.output / 'history.json')[:start_epoch]
         best = previous['best_score']
+        if args.mode == 'joint':
+            migration = migrate_best_selection(args.output, previous, config['evaluation'], bundle['target_scaler'])
+            if migration:
+                best = migration['best_score'] if migration['best_score'] is not None else -math.inf
         for index, positions in enumerate(MatchedSampler(train, args.cycles, args.batch_size, args.seed, args.mode)):
             if index >= start_cycle * (3 if args.mode == 'joint' else 1):
                 break
@@ -213,7 +222,8 @@ def main():
             print(f'验证中 | Epoch {epoch + 1}/{epochs} | 全部 {len(val):,} 条 ...', flush=True)
             metrics = evaluate(model, val_loader, device, bundle['target_scaler'], bundle['schema'], 'fp32')
             metrics['diagnostic_context'] = {'mode': args.mode, 'auxiliary_heads_trained': args.mode == 'joint'}
-            score = metrics['classification']['modulation']['accuracy']
+            score = (metrics['proxy_score'] if args.mode == 'joint' else
+                     metrics['classification']['modulation']['accuracy'])
             improved = score > best
             best = max(best, score)
             updates = end * slots
@@ -221,7 +231,9 @@ def main():
                 'model_config': model.config, 'dataset_fingerprint': train.info['fingerprint'],
                 'stage': 'supervised' if args.mode == 'joint' else 'diagnostic',
                 'training_config': config, 'epoch': epoch, 'global_step': updates, 'modulation_updates': end,
-                'metrics': metrics, 'diagnostic_mode': args.mode}
+                'metrics': metrics, 'diagnostic_mode': args.mode,
+                'selection': {'metric': 'proxy_score' if args.mode == 'joint' else 'diagnostic_modulation_accuracy',
+                              'official': False}}
             payload['initialization_source_steps'] = pretraining_steps
             payload.update(optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict(), best_score=best,
                 modulation_batch_stream_sha256=stream_hash.hexdigest(), history=history + [{
@@ -230,12 +242,13 @@ def main():
                     'training': progress.summary(), 'metrics': metrics,
                     'modulation_batch_stream_sha256': stream_hash.hexdigest()}])
             save_checkpoint(args.output / 'last.pt', payload)
+            best_name = 'best.pt' if args.mode == 'joint' else 'best_modulation_diagnostic.pt'
             if improved:
-                save_checkpoint(args.output / 'best.pt', payload)
+                save_checkpoint(args.output / best_name, payload)
             write_json(args.output / 'metrics.json', metrics)
             write_json(args.output / f'metrics_epoch_{epoch + 1:02d}.json', metrics)
             training = progress.summary()
-            epoch_summary(epoch, epochs, training, metrics, True, improved, ['last.pt'] + (['best.pt'] if improved else []), True)
+            epoch_summary(epoch, epochs, training, metrics, True, improved, ['last.pt'] + ([best_name] if improved else []), True)
             row = {'event': 'epoch', 'epoch': epoch + 1, 'modulation_updates': end, 'optimizer_updates': updates,
                    'modulation_exposures': end * args.batch_size, 'training': training, 'metrics': metrics,
                    'modulation_batch_stream_sha256': stream_hash.hexdigest()}

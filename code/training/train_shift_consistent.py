@@ -29,6 +29,8 @@ from utils.config import merge_known, resolve_config, training_options, make_sch
 from utils.contrastive import load_with_training_aux
 from utils.dataset import PreparedDataset, BalancedBatchSampler, collate, to_device
 from utils.engine import autocast, supervised_loss
+from utils.scoring import add_composite_score, selection_definition, TASK_WEIGHTS
+from utils.checkpoint_selection import migrate_best_selection
 from utils.head_optimizer import active_heads, clear_inactive_head_gradients
 from utils.process_lifecycle import managed_entrypoint
 from utils.tensorboard_log import TensorBoardLog
@@ -115,6 +117,7 @@ def evaluate_model(model, bundle, dataset, rows, output, name, device, batch_siz
     prediction = predict(model, rows, dataset.iq, dataset.meta, bundle['target_scaler'],
                          device, batch_size, name)
     metric = task_metrics(prediction, dataset.meta, bundle['schema'])
+    add_composite_score(metric, bundle['target_scaler'])
     y = dataset.meta['modulation'][prediction['rows']]
     metric['classification']['qam'] = class_result(prediction['modulation'], y,
         bundle['schema']['classification_labels']['modulation'], np.isin(y, [4, 5, 6, 7, 12]))
@@ -271,6 +274,12 @@ def main():
                 shutil.copy2(filename, destination)
         for filename in [Path(__file__), ROOT/'code/training/validate_c01_followup.py']:
             shutil.copy2(filename, out/'source_snapshot'/filename.name)
+    composite_evaluation = {'selection_metric': 'proxy_score', 'proxy_task_weights': TASK_WEIGHTS}
+    if previous:
+        migration = migrate_best_selection(out, previous, composite_evaluation, bundle['target_scaler'])
+        if migration:
+            best_score = migration['best_score'] if migration['best_score'] is not None else -math.inf
+        add_composite_score(baseline, bundle['target_scaler'])
     rows = smoke_validation(val) if args.smoke else val.indices
     stop = min(c['training']['steps'], args.max_steps or c['training']['steps'])
     write_json(out/'resolved_config.json', c)
@@ -286,6 +295,7 @@ def main():
             'stage': 'supervised', 'dataset_fingerprint': train.info['fingerprint'],
             'global_step': step, 'initialization_source_steps': origin_steps,
             'metrics': metric, 'baseline_metrics': baseline, 'best_score': best_score,
+            'selection': selection_definition('supervised', composite_evaluation),
             'metrics_validation_step': last_metrics_step if resumable else step,
             'source_sha256': source_hash, 'weight_estimator': estimator, 'smoke': args.smoke,
             'resume_allowed': False, 'resume_entrypoint': 'code/training/train_shift_consistent.py'}
@@ -307,9 +317,9 @@ def main():
         tb.metadata(c, report, step)
         if baseline is None:
             baseline = evaluate_model(model, bundle, val, rows, out, 'source_validation', device, c['evaluation']['batch_size'])
-            best_score = baseline['classification']['modulation']['accuracy']
+            best_score = baseline['proxy_score']
             save_checkpoint(out/'best.pt', payload(baseline, 'initial'))
-            say(f'起点调制={100*best_score:.4f}% | full_validation={not args.smoke}; 未提升时保留此起点')
+            say(f'起点本地综合分={best_score:.6f}/100（非官方） | full_validation={not args.smoke}; 未提升时保留此起点')
         last_metrics = resumed_metrics or baseline
 
         def assess():
@@ -321,14 +331,16 @@ def main():
                 for estimator, state in [('last', original), ('ema', ema)]:
                     model.load_state_dict(state, strict=True)
                     metric = evaluate_model(model, bundle, val, rows, evaluation_dir, estimator, device, c['evaluation']['batch_size'])
-                    score = metric['classification']['modulation']['accuracy']
+                    score = metric['proxy_score']
                     allowed, violations = selection(metric, baseline, c['evaluation'])
-                    improved = allowed and score > best_score
+                    improved = score > best_score  # Guards remain diagnostics; primary best is composite.
                     if improved:
                         best_score = score
                         save_checkpoint(out/'best.pt', payload(metric, estimator))
                     save_checkpoint(out/(estimator+'_model.pt'), payload(metric, estimator))
-                    record(dict(event='validation', step=step, estimator=estimator, accuracy=score,
+                    record(dict(event='validation', step=step, estimator=estimator,
+                                accuracy=metric['classification']['modulation']['accuracy'],
+                                score=score, selection_metric='proxy_score',
                                 eligible=allowed, violations=violations, improved=improved, best_score=best_score))
                     for task, values in metric['classification'].items():
                         for key in ['accuracy', 'macro_f1', 'weighted_f1', 'cross_entropy']:
@@ -336,8 +348,11 @@ def main():
                     for field, values in metric['parameters'].items():
                         for key in ['rmse', 'mae', 'absolute_error_p95']:
                             tb.scalar(f'validation/{estimator}/parameters/{field}/{key}', values.get(key), step)
-                    say(f'验证 step={step} {estimator}: 调制={100*score:.4f}% | 前14={100*metric["classification"]["first14"]["accuracy"]:.3f}%'
-                        f' | QAM={100*metric["classification"]["qam"]["accuracy"]:.3f}% | 通过保护={allowed} | best={100*best_score:.4f}% | {violations}')
+                    tb.scalar(f'validation/{estimator}/local_composite', score, step)
+                    say(f'验证 step={step} {estimator}: 本地综合分={score:.6f}（非官方）'
+                        f' | 调制={100*metric["classification"]["modulation"]["accuracy"]:.4f}%'
+                        f' | 前14={100*metric["classification"]["first14"]["accuracy"]:.3f}%'
+                        f' | QAM={100*metric["classification"]["qam"]["accuracy"]:.3f}% | 保护项诊断={allowed} | best={best_score:.6f} | {violations}')
                     if estimator == 'last':
                         last_metrics, last_metrics_step = metric, step
             finally:
@@ -345,6 +360,8 @@ def main():
                 model.train()
             save_checkpoint(out/'last.pt', payload(last_metrics, 'last', resumable=True))
 
+        if not math.isfinite(best_score):
+            assess()  # Legacy resume had no weight/metric-aligned candidate to reselect.
         sampler = BalancedBatchSampler(train, c['training']['batch_size'], c['training']['steps'],
                                        c['training']['seed'], mode='balanced')
         started = time.monotonic()
@@ -413,10 +430,11 @@ def main():
             progress.close()
         export_best(out/'best.pt', out/'exported_best')
         write_json(out/'completion.json', dict(status='complete' if step == c['training']['steps'] else 'stopped_at_cap',
-            steps=step, best_accuracy=best_score, source_accuracy=baseline['classification']['modulation']['accuracy'],
-            improved=best_score > baseline['classification']['modulation']['accuracy'], smoke=args.smoke,
+            steps=step, best_score=best_score, selection_metric='proxy_score', source_score=baseline['proxy_score'],
+            source_accuracy=baseline['classification']['modulation']['accuracy'],
+            improved=best_score > baseline['proxy_score'], smoke=args.smoke,
             inference_weights=str(out/'exported_best'), resume_checkpoint=str(out/'last.pt')))
-        say(f'完成 | best={100*best_score:.4f}% | 导出={out/"exported_best"} | smoke={args.smoke}')
+        say(f'完成 | 本地综合分best={best_score:.6f}/100（非官方） | 导出={out/"exported_best"} | smoke={args.smoke}')
 
 
 if __name__ == '__main__':

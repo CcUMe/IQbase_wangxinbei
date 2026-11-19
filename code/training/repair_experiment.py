@@ -67,7 +67,8 @@ def main():
     p.add_argument('--label-smoothing', type=float, default=0.)
     p.add_argument('--modulation-phase-probability', type=float, default=0.)
     p.add_argument('--modulation-shift-probability', type=float, default=0.)
-    p.add_argument('--selection-metric', choices=['proxy_score', 'modulation_accuracy'], default='proxy_score')
+    p.add_argument('--selection-metric', choices=['proxy_score'], default='proxy_score',
+                   help='Three-task local composite; modulation-only primary checkpoints are no longer supported')
     args = p.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     device, _, world = runtime(args.device)
@@ -121,7 +122,7 @@ def main():
         nonlocal best
         metrics = evaluate(model, val_loader, device, bundle['target_scaler'], bundle['schema'], 'fp32')
         score = metrics['proxy_score']
-        selection = metrics['classification']['modulation']['accuracy'] if args.selection_metric == 'modulation_accuracy' else score
+        selection = score
         row = {'event': 'validation', 'step': step, 'score': score,
                'selection_value': selection, 'selection_metric': args.selection_metric,
                'modulation': metrics['classification']['modulation']['accuracy'],

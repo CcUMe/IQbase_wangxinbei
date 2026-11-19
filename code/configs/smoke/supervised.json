@@ -156,7 +156,7 @@
     "max_batches": 0, // 验证批数上限，0全量；非0仅短测，不能当完整验证集指标。
     "precision": "fp32", // 可选fp32、bf16、fp16；验证精度独立于训练，正式比较保持一致。
     "mask_seed": 12345, // 仅预训练验证的固定遮挡种子，使同一目标下的验证loss可比较。
-    "selection_metric": "auto", // auto自动选择；监督可选proxy_score/modulation_accuracy/protocol_accuracy/parameter_proxy；预训练可选pretraining_loss。
+    "selection_metric": "proxy_score", // auto自动选择；监督/微调统一proxy_score（三任务本地综合分）；预训练按结构验证损失。
     "proxy_task_weights": {
       "modulation": 30.0, // 本地综合代理指标的调制权重；只用于评估/选模，不影响训练损失。
       "protocol": 30.0, // 本地综合代理指标的协议权重；代理指标不等于官方成绩。

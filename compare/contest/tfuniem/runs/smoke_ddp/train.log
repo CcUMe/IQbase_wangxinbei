@@ -1,4 +1,0 @@
-2026-11-15 19:30:53 torch 2.11.0+cu128 cuda 12.8 world 2 cache /mnt/disk1/suyang/contest/artifacts/cache_v1
-2026-11-15 19:30:53 parameters {"total": 26393401, "shared": 26006640, "task_specific": 386761, "shared_fraction": 0.9853462992510893, "per_task": {"modulation": {"used": 26086345, "shared_fraction_of_used": 0.9969445700422961}, "protocol": {"used": 26083450, "shared_fraction_of_used": 0.9970552208392678}, "parameter": {"used": 26236886, "shared_fraction_of_used": 0.9912243396567718}}}
-2026-11-15 19:31:47 VAL ep 1: proxy=46.473 pro=0.6739 mod=0.2069 (nb14=0.0776 oth9=0.4091) pp=0.5012 grp=0.9992 | RMSE sr=546.2 bw=841.5 fs=406.62 pw=1.729us pri=1.739us td=2.594us np=1.409 | argmax-decode proxy=45.004 (35s)
-2026-11-15 19:31:48   new best proxy 46.473 at epoch 1

@@ -1,5 +1,7 @@
 # C01 电磁感知模型：训练与推理代码
 
+2026-11-17新增P8共享接收前端v1候选，默认从头监督测试：`python code/training/train.py --config code/configs/supervised/shared_base_p8_receiver_v1.json5`。原P8主干和三任务头保留，新增复FIR与可迭代候选采样轨迹残差；监督、两轮预训练和独立微调共用该骨干。当前仅验证功能与迁移，精度收益待正式实验。详见[接收前端v1](docs/receiver_frontend_v1.md)。
+
 2026-11-16训练统一为 `python code/training/train.py --config ...`，通过配置分别启动两轮预训练和独立微调。P8正式配置：`pretrain/two_rounds_p8.json5`、`finetune/shared_base_p8.json5`；预训练50轮→新教师构词→第二轮50轮后停止，不自动微调。当前两轮配置保留GPU2,3、每卡256；LR-v2第一轮6e-4/6e-4、第二轮骨干3e-4/结构头6e-4，均10%warmup+cosine。微调单卡GPU0、全参20轮、骨干1e-4/任务头3e-4、权重衰减0.08、3%warmup+cosine；新输出目录`logs/shared_base_p8_lr_v2`及`logs/finetune_shared_base_p8_lr_v2`。重复的专用Python/bash启动器已移除，历史配置和产物保留。见[统一训练入口与配置](docs/unified_training.md)。
 
 P8/P16三阶段模型说明分别见[P8说明](docs/shared_base_p8_training.md)、[共享基座说明](docs/shared_base_training.md)。本次没有修改架构或宣称新精度收益。欧氏构词候选及论文适配边界见[结构预训练论文核查](docs/structural_paper_audit_20261116.md)；C01没有真实采样率，不伪造RoPE-fs。
@@ -28,7 +30,7 @@ P8/P16三阶段模型说明分别见[P8说明](docs/shared_base_p8_training.md)�
 
 ## 配置驱动启动
 
-当前P8 LR-v2从第一步全参微调：任务头峰值LR3e-4、骨干1e-4，前3%更新线性预热后cosine衰减至5%，20轮、单卡batch256。best.pt按调制准确率选择，并保留综合最佳候选。配置与恢复见[统一训练说明](docs/unified_training.md)；历史round配置沿用各自配方，质量收益仍需正式训练验证。
+当前P8 LR-v2从第一步全参微调：任务头峰值LR3e-4、骨干1e-4，前3%更新线性预热后cosine衰减至5%，20轮、单卡batch256。best.pt统一按体制30／调制30／参数40的本地综合近似分选择，非官方分。配置与恢复见[统一训练说明](docs/unified_training.md)及[综合选模说明](docs/composite_checkpoint_selection.md)；历史round配置沿用各自配方，质量收益仍需正式训练验证。
 
 已激活py313环境后，核心入口只需传配置，数据/输出/词表/检查点和GPU均在配置中：
 
@@ -173,7 +175,7 @@ C01_MAIN_RUN=$("$C01_PY" code/utils/run_directory.py --latest logs/supervised_py
 
 `--output`指定实验父目录，新训练自动创建上海时区的时间戳子目录，例如`logs/supervised_pyramid_phase/20261113_180000_123456/`。同一命令重复启动会生成不同目录。终端总览显示实际路径，父目录`latest_run.json`记录最近创建的运行。续训应选择确定的检查点，最新目录不等同于最佳模型。
 
-每次运行目录包含 `best.pt`、`last.pt`、`metrics.json`、`parameter_report.json`、`resolved_config.json`、`train.log`、`events.jsonl` 和 `run_info.json`。`best.pt` 按 `evaluation.selection_metric` 选择，当前主配置为调制准确率，同时始终报告协议与参数误差；`auto` 在监督阶段按本地代理分选择，代理分不是官方成绩。断点续训要求保持配置、数据划分、世界大小、词表及配对合并方式一致，并继续写入检查点所在的原目录：
+每次运行目录包含 `best.pt`、`last.pt`、`metrics.json`、`parameter_report.json`、`resolved_config.json`、`train.log`、`events.jsonl` 和 `run_info.json`。监督／微调的`best.pt`统一按三任务本地综合分选择，分项为体制30、调制30、参数40；参数以训练侧固定std归一化RMSE近似，不能声称是官方分。预训练仍按结构损失选择教师。旧调制选模检查点通过当前入口恢复时，会归档旧best、按现存有效权重重选综合best并重置旧口径早停。其余模型／训练配置、数据划分、世界大小、词表及配对合并方式仍须一致，并继续写入原目录：
 
 终端先输出训练总览，再逐 epoch 显示 step 进度、平均损失、主要分项和学习率；验证输出调制/协议的 Accuracy、Macro-F1、Weighted-F1，以及逐类 Recall（该类识别准确率）、Precision、F1、Support 和七项参数 RMSE。双卡仅主进程显示。
 

@@ -1,0 +1,20 @@
+// GPU0串行：当前联合第一轮→旧C01第一轮；每组先跑5轮更新，保留20轮调度。
+{
+  "workflow": "experiment_suite",
+  "run": {
+    "output": "logs/finetune_r1_comparison_gpu0"
+  },
+  "runtime": {
+    "gpus": "0"
+  },
+  "experiments": [
+    {
+      "name": "mixed_r1",
+      "config": "code/configs/finetune/r1_probe_mixed_r1_gpu0.json5"
+    },
+    {
+      "name": "c01_r1_baseline",
+      "config": "code/configs/finetune/r1_probe_c01_r1_baseline_gpu0.json5"
+    }
+  ]
+}

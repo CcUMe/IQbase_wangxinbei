@@ -1,0 +1,33 @@
+// 联合训练集拟合：两个来源的原子特征池均衡、BPE序列均衡；验证仅使用固定词表赋码。
+{
+  "run": {
+    "data": "artifacts/data_c01_radioml_p8_v1",
+    "output": "artifacts/structure_c01_radioml_p8_v1/codebook_v1",
+    "teacher_checkpoint": ""
+  },
+  "atomic": {
+    "vocab_size": 512,
+    "max_patches": 200000,
+    "iterations": 20,
+    "chunk_size": 4096,
+    "metric": "euclidean",
+    "normalization": "rms",
+    "amplitude_percentile": 99.0,
+    "batch_size": 16384,
+    "initializations": 5
+  },
+  "emergent": {
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "fit_tokens": 0,
+    "min_frequency": 20
+  },
+  "runtime": {
+    "batch_size": 512,
+    "seed": 20261115,
+    "device": "auto",
+    "threads": 4,
+    "gpus": "2"
+  }
+}

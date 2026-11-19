@@ -51,7 +51,9 @@ def main():
                        args.max_batches, settings.get('proxy_task_weights'))
     write_json(args.output, metrics)
     classification_summary(metrics)
-    print(f"Validation rows={metrics['rows']}; local proxy={metrics['proxy_score']:.4f} (not official score)")
+    parts = metrics['local_composite']['components']
+    print(f"Validation rows={metrics['rows']}; local composite={metrics['proxy_score']:.6f}/100 (NOT official)")
+    print('Weighted components: ' + ' | '.join(f'{k}={v:.6f}' for k,v in parts.items()))
 
 
 if __name__ == '__main__':

@@ -28,6 +28,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--processes', type=int, choices=[1, 2], default=1)
     parser.add_argument('--patch-size', type=int, choices=[8, 16], default=16)
+    parser.add_argument('--receiver', action='store_true', help='Validate the new shared reception frontend')
     parser.add_argument('--dictionary-metric',choices=['spherical','euclidean'],default='spherical')
     parser.add_argument('--min-frequency',type=int,default=1)
     parser.add_argument('--mask-strategy',choices=['random','bernoulli_starts'],default='random')
@@ -66,10 +67,16 @@ def main():
     else:
         raise AssertionError('Round2 accepted a raw-IQ/incorrect teacher vocabulary')
     for stage in ['pretrain', 'finetune']:
-        basename='shared_base_p8.json5' if args.patch_size==8 else 'shared_base.json5'
+        basename=('shared_base_p8_receiver_v1.json5' if args.receiver else
+                  'shared_base_p8.json5' if args.patch_size==8 else 'shared_base.json5')
         config = load_config(ROOT / 'code/configs' / stage / basename)
         config['model']['encoder'].update(width=64, depth=2, heads=4, dropout=0., attention_dropout=0.)
         config['model']['iq_geometry']['bottleneck'] = 8
+        if args.receiver:
+            assert args.patch_size == 8
+            config['model']['receiver_frontend']['filter']['taps'] = 5
+            config['model']['receiver_frontend']['timing'].update(periods=[4.,8.,16.],hidden=8)
+            config['model']['receiver_frontend']['readout'].update(width=16,dropout=0.)
         config['run'].update(data=str(data), codebook=str(first_book) if stage == 'pretrain' else '',
                              init_checkpoint='', warmstart_checkpoint='')
         config['training']['epochs'] = 1
@@ -165,7 +172,8 @@ def main():
     assert saved_fine['training_config']['optimizer']['weight_decay']==.08
     assert saved_fine['training_config']['finetuning']['strategy']=='full'
     assert saved_fine['training_config']['scheduler']['name']=='cosine'
-    basename='shared_base_p8.json5' if args.patch_size==8 else 'shared_base.json5'
+    basename=('shared_base_p8_receiver_v1.json5' if args.receiver else
+              'shared_base_p8.json5' if args.patch_size==8 else 'shared_base.json5')
     supervised = load_config(ROOT / 'code/configs/supervised' / basename)
     formal_pretrain = load_config(ROOT / 'code/configs/pretrain' / basename)
     formal_fine = load_config(ROOT / 'code/configs/finetune' / basename)
@@ -202,7 +210,7 @@ def main():
     assert (directory/'source_snapshot/sha256.json').read_bytes()==hashes
     assert not (directory/'finetune').exists()
     write_json(output / 'verification.json', {'passed': True, 'pipeline': str(directory), 'training_world_size': args.processes, 'patch_size':args.patch_size,
-        'dictionary_metric':args.dictionary_metric,'min_frequency':args.min_frequency,'mask_strategy':args.mask_strategy,'pretraining_reduction':args.pretraining_reduction,
+        'dictionary_metric':args.dictionary_metric,'min_frequency':args.min_frequency,'mask_strategy':args.mask_strategy,'pretraining_reduction':args.pretraining_reduction,'receiver':args.receiver,
         'round1_steps': 3, 'round2_steps': 3, 'finetune_steps': 3, 'inference_rows': 12,
         'checks': ['real teacher vocabulary regeneration', 'backbone-only transfer with fresh structure heads',
                    'same three-stage model definition', 'exact checkpoint binding', 'completed-stage resume',

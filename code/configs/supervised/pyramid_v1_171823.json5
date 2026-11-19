@@ -216,7 +216,7 @@
     "max_batches": 0,
     "precision": "fp32",
     "mask_seed": 12345,
-    "selection_metric": "modulation_accuracy",
+    "selection_metric": "proxy_score",
     "early_stopping": {
       "patience": 8,
       "min_delta": 0.001

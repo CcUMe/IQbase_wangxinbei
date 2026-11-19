@@ -9,6 +9,7 @@ from utils.common import TARGETS
 from utils.dataset import to_device
 from utils.metrics import classification_metrics
 from utils.contrastive import supervised_contrastive
+from utils.scoring import add_composite_score
 
 
 def autocast(device, precision):
@@ -226,26 +227,24 @@ def evaluate(model, loader, device, scaler, schema, precision='fp32', max_batche
         metrics['classification'][task] = {**classification_metrics(matrix, schema['classification_labels'][task]),
             'cross_entropy': classification_sums[task][0] / max(int(matrix.sum()), 1),
             'mean_confidence': classification_sums[task][1] / max(int(matrix.sum()), 1)}
+    if confusion['modulation'].shape[0]==23:
+        from utils.metrics import classification_group_metrics
+        metrics['modulation_groups']={name:classification_group_metrics(confusion['modulation'],ids)
+            for name,ids in [('first14',range(14)),('last9',range(14,23)),
+                             ('qam',[4,5,6,7,12]),('psk_related',[1,2,3,8,13])]}
     rmse = np.sqrt(sse / np.maximum(count, 1))
     for j, name in enumerate(TARGETS):
         errors = np.concatenate(error_chunks[j]) if error_chunks[j] else np.empty(0)
         metrics['parameters'][name] = {'count': int(count[j]), 'rmse': float(rmse[j]) if count[j] else None,
             'mae': float(sae[j] / count[j]) if count[j] else None,
             'absolute_error_p95': float(np.quantile(errors, .95)) if len(errors) else None}
-    r = float((rmse[count > 0] / std[count > 0]).mean()) if (count > 0).any() else None
-    metrics['parameter_proxy'] = 1 / (1 + r) if r is not None else 0.0
-    weights = proxy_weights or {'protocol': 30., 'modulation': 30., 'parameter': 40.}
-    metrics['proxy_score'] = (weights['protocol'] * metrics['classification']['protocol']['accuracy'] +
-                              weights['modulation'] * metrics['classification']['modulation']['accuracy'] + weights['parameter'] * metrics['parameter_proxy'])
-    metrics['proxy_task_weights'] = weights
-    metrics['score_note'] = 'Local normalized-RMSE proxy, NOT the official contest score.'
-    return metrics
+    return add_composite_score(metrics, scaler, proxy_weights)
 
 
 @torch.inference_mode()
-def evaluate_pretraining(model, loader, device, config, codebook, maximum=20):
+def evaluate_pretraining(model, loader, device, config, codebook, maximum=20, details=False):
     model.eval()
-    values = [];token_sum=0.;token_count=0
+    values = [];token_sum=0.;token_count=0;source_totals={};group_totals={}
     for step, batch in enumerate(loader):
         if maximum and step >= maximum:
             break
@@ -259,6 +258,31 @@ def evaluate_pretraining(model, loader, device, config, codebook, maximum=20):
             count=int((mask&output['token_valid']).sum())
             token_sum+=float(loss)*count;token_count+=count
         values.extend([float(loss)] * len(batch['lengths']))
+        if details and 'source_ids' in batch:
+            size=len(batch['lengths'])
+            def subset(value,chosen):
+                if isinstance(value,dict):return {k:subset(v,chosen) for k,v in value.items()}
+                if isinstance(value,torch.Tensor) and value.ndim and len(value)==size:return value[chosen]
+                return value
+            for source in batch['source_ids'].unique().tolist():
+                chosen=batch['source_ids']==source
+                selected_output=subset(output,chosen);selected_batch=subset(batch,chosen)
+                selected_loss,_=pretraining_loss(selected_output,selected_batch,mask[chosen],config,codebook,distributed=False)
+                count=(int((mask[chosen]&selected_output['token_valid']).sum())
+                       if config.get('pretraining_reduction','per_record')=='masked_token_mean' else int(chosen.sum()))
+                total,previous=source_totals.get(int(source),(0.,0))
+                source_totals[int(source)]=(total+float(selected_loss)*count,previous+count)
+            if 'pretraining_groups' in batch:
+                for group in batch['pretraining_groups'].unique().tolist():
+                    chosen=batch['pretraining_groups']==group
+                    selected_output=subset(output,chosen);selected_batch=subset(batch,chosen)
+                    selected_loss,_=pretraining_loss(selected_output,selected_batch,mask[chosen],config,codebook,distributed=False)
+                    count=(int((mask[chosen]&selected_output['token_valid']).sum())
+                           if config.get('pretraining_reduction','per_record')=='masked_token_mean' else int(chosen.sum()))
+                    total,previous=group_totals.get(int(group),(0.,0))
+                    group_totals[int(group)]=(total+float(selected_loss)*count,previous+count)
     if config.get('pretraining_reduction','per_record')=='masked_token_mean':
-        return token_sum/token_count if token_count else None
-    return float(np.mean(values)) if values else None
+        result=token_sum/token_count if token_count else None
+    else:result=float(np.mean(values)) if values else None
+    return {'loss':result,'by_source':{k:total/count for k,(total,count) in source_totals.items() if count},
+            'by_group':{k:total/count for k,(total,count) in group_totals.items() if count}} if details else result

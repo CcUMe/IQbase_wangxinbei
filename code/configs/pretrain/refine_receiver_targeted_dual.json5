@@ -1,0 +1,47 @@
+// 固定第一轮教师→GPU2构词→CPU词表审计→GPU2,3第二轮50轮；不自动微调。
+{
+  "workflow": "refine_pretrain",
+  "run": {
+    "output": "logs/receiver_targeted_round2_dual",
+    "teacher_checkpoint": "artifacts/refined_pretrain_teacher/round1_best.pt"
+  },
+  "configs": {
+    "pretrain": "code/configs/pretrain/receiver_targeted_round2.json5"
+  },
+  "runtime": {
+    "gpus": "2,3",
+    "processes": 2,
+    "device": "auto"
+  },
+  "codebook": {
+    "atomic_vocab": 512,
+    "max_patches": 200000,
+    "cluster_iterations": 20,
+    "cluster_chunk_size": 4096,
+    "merges": 512,
+    "max_span": 5,
+    "fit_sequences": 20000,
+    "batch_size": 512,
+    "seed": 20261115,
+    "threads": 4,
+    "metric": "euclidean",
+    "normalization": "rms",
+    "amplitude_percentile": 99.0,
+    "cluster_batch_size": 16384,
+    "cluster_initializations": 5,
+    "bpe_tokens": 2560000,
+    "min_frequency": 20,
+    "precision": "bf16",
+    "label_workers": 4,
+    "sampling": {
+      "policy": "target_token_quota",
+      "group_weights": {
+        "c01_first14": 0.4,
+        "c01_other_modulation": 0.1,
+        "c01_protocol": 0.15,
+        "c01_parameter": 0.2,
+        "radioml": 0.15
+      }
+    }
+  }
+}

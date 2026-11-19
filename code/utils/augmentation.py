@@ -22,8 +22,14 @@ def augment_iq(iq, settings):
 
 
 def augment_supervised_iq(batch, settings):
-    """Additional time-origin invariance only for records with modulation labels alone."""
+    """Label-preserving phase views; time shifts only for pure modulation rows."""
     iq = augment_iq(batch['iq'], settings)
+    parameter_probability = settings.get('parameter_only', {}).get('phase_rotation_probability', 0.)
+    if parameter_probability:
+        eligible = (batch['modulation'] < 0) & (batch['protocol'] < 0) & batch['target_valid'].any(-1)
+        selected = eligible & (torch.rand(len(iq), device=iq.device) < parameter_probability)
+        angles = torch.rand(len(iq), device=iq.device) * (2 * math.pi) * selected
+        iq = rotate_phase(iq, angles)
     options = settings.get('modulation_only', {})
     phase = options.get('phase_rotation_probability', 0.)
     shift = options.get('circular_shift_probability', 0.)

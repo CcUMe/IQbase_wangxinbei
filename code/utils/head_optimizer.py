@@ -29,7 +29,8 @@ def active_heads(batch, config):
     if config['task_weights'][2] and bool((valid & (weights > 0)).any()):
         active.add('heads.queries.')
         if (config['model'].get('pyramid', {}).get('enabled', False)
-                or config['model'].get('hierarchy', {}).get('enabled', False)):
+                or config['model'].get('hierarchy', {}).get('enabled', False)
+                or config['model'].get('parameter_readout', {}).get('enabled', False)):
             active.update(f'heads.regression.{j}.' for j in range(7) if weights[j] > 0 and bool(valid[:, j].any()))
         else:
             active.add('heads.regression.')
